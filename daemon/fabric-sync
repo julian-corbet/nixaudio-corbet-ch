@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """fabric-sync — mirror every fabric peer's PipeWire devices as local tunnels (event-driven).
 
-One per-node systemd service. Resolves peers by their STABLE LAN IP (see FABRIC_NODES). Every device of
-every fabric peer appears locally as a tunnel — both sink and source, every direction.
+One per-node systemd service. Peers are declared by nixaudio and re-read from the generated config on
+every discovery pass, so a peer added to the fleet joins without restarting this daemon (see
+fabric_nodes). Every device of every fabric peer appears locally as a tunnel — both sink and source,
+every direction.
 
 WORKS EVERYWHERE: tunnels run on every node, home or roaming. Two safeguards keep a stalled remote
 tunnel from wedging this node's LOCAL audio (the 2026-06-18 incident): (1) ISOLATION — every tunnel is
@@ -82,7 +84,47 @@ def log(*a):
 # Peers come from nixaudio.fabric.peers, which itself defaults to nixnet's declared peer set.
 # Keys are whatever the peer is REACHED at (prefer a nixnet-published name over a raw address);
 # values are the display name. Self is skipped by the existing local-IP / hostname match below.
-FABRIC_NODES = _CFG.get("peers", {})
+#
+# RE-READ, not frozen at import. The peer table is the one part of this config that genuinely
+# changes under a running daemon: the fleet gains a host, and the generated config is rewritten by
+# the next switch. Nothing restarts this unit when that happens -- switch-to-configuration does not
+# restart running `systemd --user` services, and the unit file is byte-identical anyway, since only
+# the file it POINTS AT changed. A table captured at import therefore stays wrong indefinitely,
+# while the daemon reports itself healthy: `systemctl status` says active, the config on disk is
+# correct, and the two silently disagree. That is exactly the class of quiet drift this daemon was
+# moved into nixaudio to end, so discovery reads the file rather than a snapshot of it.
+#
+# Only the PEER TABLE is refreshed. PORT and FABRIC_LOOP stay as read at startup: every loaded
+# tunnel carries both baked into its module arguments, so changing them live would mean tearing
+# down and rebuilding every tunnel on the host. They are also the two values that do not move in
+# practice. A change to either needs a restart, and says so here rather than half-applying.
+_PEERS = _CFG.get("peers", {})
+_CFG_ERROR = None
+
+
+def fabric_nodes():
+    """The peer table, re-read from the config file. Returns the last known-good table if the file
+    cannot be read or parsed -- a half-written or briefly-missing config must not collapse the peer
+    set to empty, because an empty set reads as 'every peer left the fabric' and would unload every
+    tunnel on the host over a transient."""
+    global _PEERS, _CFG_ERROR
+    try:
+        with open(_CFG_PATH) as f:
+            fresh = json.load(f).get("peers", {})
+    except Exception as e:
+        if str(e) != _CFG_ERROR:
+            _CFG_ERROR = str(e)
+            log(f"config {_CFG_PATH} unreadable ({e}) — keeping the last known-good peer table")
+        return _PEERS
+    _CFG_ERROR = None
+    if fresh != _PEERS:
+        changed = ([f"+{p}" for p in sorted(set(fresh) - set(_PEERS))]
+                   + [f"-{p}" for p in sorted(set(_PEERS) - set(fresh))])
+        # A change with no key difference is a renamed peer -- still worth one line, since it moves
+        # every one of that peer's tunnel labels on the next reconcile.
+        log("peer table changed: " + (", ".join(changed) if changed else "peer names updated"))
+        _PEERS = fresh
+    return _PEERS
 
 
 def self_ips():
@@ -104,7 +146,7 @@ def fabric_peers():
     selfips = self_ips()
     selfhost = socket.gethostname().lower()
     out = {}
-    for ip, host in FABRIC_NODES.items():
+    for ip, host in fabric_nodes().items():
         if ip in selfips or host.lower() == selfhost:
             continue
         try:

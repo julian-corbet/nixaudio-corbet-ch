@@ -618,6 +618,25 @@ let
   failures = builtins.filter (e: !e.ok) expectations;
 in
 {
+  # The one check here that is not a pure evaluation, and cannot be. "Does a RUNNING daemon notice
+  # that its config changed" is a runtime property by definition -- no amount of evaluating options
+  # can observe it, because the defect lives entirely in the gap between what the generated file
+  # says and what a long-lived process still holds in memory. So this check actually executes the
+  # daemon's discovery entry point against a config file that is rewritten underneath it. See
+  # ./daemon-peer-reload.py's own header for the production failure it reproduces.
+  daemon = pkgs.runCommand "nixaudio-daemon-checks"
+    {
+      nativeBuildInputs = [ pkgs.python3 pkgs.iproute2 ];
+      # The fixture stands up a real loopback listener so the daemon's reachability probe runs for
+      # real rather than being stubbed -- a stubbed probe could pass while the probe itself is what
+      # is broken.
+      FABRIC_SYNC = ../daemon/fabric-sync;
+    } ''
+    cd "$(mktemp -d)"
+    python3 ${./daemon-peer-reload.py}
+    touch $out
+  '';
+
   purity = pkgs.runCommand "nixaudio-purity-checks" { } ''
     ${lib.optionalString (failures != [ ]) ''
       echo "nixaudio checks FAILED:" >&2
