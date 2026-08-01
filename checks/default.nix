@@ -40,6 +40,7 @@ let
     modules = [
       nixaudioModule
       { options.assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
+      { options.warnings = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; }; }
       { options.services.pipewire = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.environment.etc = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
@@ -67,6 +68,7 @@ let
     options.xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
     options.systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
     options.assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
+    options.warnings = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
   };
 
   evalHome = modules: lib.evalModules {
@@ -111,6 +113,21 @@ let
     nixusbStub
     nixnetStub
     { nixaudio.fabric.enable = true; nixaudio.fabric.listen.address = "203.0.113.14"; }
+  ];
+
+  # nixnet declares host-b as a peer key, but has published no hostnames for it -- the one flavour of
+  # "missing peer" nixaudio can actually see (see modules/fabric.nix's droppedPeers). host-a is a
+  # normal, fully-published peer in the SAME fixture, so this also proves the drop is scoped to the
+  # one incomplete entry rather than nuking the whole peer set.
+  partialPeers = eval [
+    nixusbStub
+    nixnetStub
+    {
+      nixnet.peers.host-a.hostnames = [ "host-a" ];
+      nixnet.peers.host-b.hostnames = [ ];
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+    }
   ];
 
   collision = eval [
@@ -307,6 +324,28 @@ let
     {
       name = "every nixnet peer joins the pool";
       ok = lib.attrNames composed.config.nixaudio.fabric.peers == [ "host-a" "host-b" ];
+    }
+    {
+      name = "a fully-published fixture raises no warning at all";
+      ok = composed.config.warnings == [ ];
+    }
+    {
+      name = "a nixnet peer declared with no published hostnames is dropped from the pool, not just left empty";
+      ok = lib.attrNames partialPeers.config.nixaudio.fabric.peers == [ "host-a" ];
+    }
+    {
+      name = "dropping that peer is LOUD: it raises a warning naming it, rather than disappearing silently";
+      ok =
+        let w = partialPeers.config.warnings;
+        in builtins.length w == 1 && lib.hasInfix "host-b" (builtins.head w);
+    }
+    {
+      name = "the warning names only the incomplete peer, never the healthy one";
+      ok = !(lib.hasInfix "host-a" (builtins.head partialPeers.config.warnings));
+    }
+    {
+      name = "a partial peer raises a warning, not an assertion -- eval succeeds with the healthy peer still usable";
+      ok = failed partialPeers == [ ];
     }
     {
       name = "the listener binds the address given, never a silent 0.0.0.0";

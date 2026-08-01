@@ -62,18 +62,38 @@
 #
 #     FABRIC_NODES = { "198.51.100.10": "host-b", "198.51.100.14": "host-c" }
 #
-# which has two failure modes baked in: a host is silently absent until someone remembers to add it,
-# and a roaming laptop is simply dead once the LAN address stops resolving, with no fallback to the
-# overlay. nixnet already solves exactly this — N candidate transports per peer, health-checked,
-# hysteresis-damped, one winner published as a name. So peers here default to nixnet's peer set and
-# are addressed BY NAME. Failover, roaming and "did anyone add the new host" all stop being this
-# module's problem.
+# which has two failure modes baked in: a host is silently absent until someone remembers to add it
+# to a second, hand-maintained list, and a roaming laptop is simply dead once the LAN address stops
+# resolving, with no fallback to the overlay. nixnet already solves exactly this — N candidate
+# transports per peer, health-checked, hysteresis-damped, one winner published as a name. So peers
+# here default to nixnet's peer set and are addressed BY NAME. Failover, roaming and "did anyone
+# remember to add the new host to THIS list too" all stop being this module's problem.
+#
+# WHAT THAT DOES NOT BUY: this removes the SECOND list, not the possibility of a gap. Disproved in
+# production (see the README's "not hypothetical" section): on the host that first adopted this
+# module, one fleet machine was simply not a peer in nixnet's OWN table yet, so the fabric peer set
+# derived from it inherited exactly the same gap, and that machine stayed unreachable. Deriving from
+# one source doesn't make the source complete — it makes there be exactly ONE place to fix instead of
+# N. That is a real, worthwhile improvement, and a narrower claim than "structurally impossible",
+# which an earlier version of this comment and the README both said and which did not hold up. See
+# the README's "What deriving from nixnet does and does not guarantee" for the full argument,
+# including which half of "a host is missing" can and cannot be caught at eval time — the `warnings`
+# entry below (`droppedPeers`) is the half that can.
 { lib, config, ... }:
 let
   cfg = config.nixaudio.fabric;
 
   # Defensive read: nixnet is a soft dependency. Without it, peers must be given explicitly.
   nixnetPeers = config.nixnet.peers or { };
+
+  # A peer nixnet has DECLARED (a key in nixnet.peers) but published no hostnames for at all is the
+  # one flavour of "missing" this module can actually see -- unlike a host nixnet never learned about
+  # in the first place, which is invisible from here (see this file's header, and the README's "What
+  # deriving from nixnet does and does not guarantee"). Filtering it out of derivedPeers below is
+  # correct -- there is nothing to dial -- but doing so with no trace would recreate the exact
+  # "quietly missing" failure this module exists to remove, just one layer up. So it is named in a
+  # warning (config.warnings, below) instead of dropped silently.
+  droppedPeers = lib.attrNames (lib.filterAttrs (_: peer: peer.hostnames == [ ]) nixnetPeers);
 
   # A peer is addressed by the first name nixnet publishes for it. nixnet maintains the
   # name -> currently-winning-address mapping, so this stays correct as transports flap.
@@ -195,8 +215,19 @@ in
       defaultText = lib.literalExpression "derived from config.nixnet.peers";
       description = ''
         The fabric's peers. Defaults to every peer nixnet declares, addressed by nixnet's published
-        name — so adding a host to the fleet adds it to the audio pool, with no second list to keep
-        in sync and no way for a host to be silently missing from one of them.
+        name — so adding a host to nixnet's peer table adds it to the audio pool automatically, with
+        no second list to hand-maintain.
+
+        That is a guarantee that this list matches nixnet's, not a guarantee that either one is
+        complete: a host missing from `config.nixnet.peers` on this host — nixnet not composed there,
+        or composed but that peer never actually joined nixnet's own view of the fleet — is derived as
+        missing here too, with nothing in this module able to see the gap. One table to fix instead of
+        two is the real benefit; it is not proof the fleet is whole. See the README's "What deriving
+        from nixnet does and does not guarantee".
+
+        A peer nixnet HAS declared but published zero hostnames for is a narrower, catchable case: it
+        is dropped from this default and raises a `warnings` entry naming it, rather than disappearing
+        with no trace.
 
         Set explicitly only to make the audio pool a strict subset of the fleet.
       '';
@@ -252,6 +283,19 @@ in
 
     nixaudio.fabric.wireplumberConfig = lib.mkIf cfg.enable mirrorPriorityConfig;
 
+    # Non-fatal on purpose -- unlike the assertion below, this names a peer that WAS declared, just
+    # incompletely, and a partially-configured nixnet peer is nixnet's business to finish, not a
+    # reason to fail this host's whole audio config. See droppedPeers above and the README's "What
+    # deriving from nixnet does and does not guarantee" for why this is the one flavour of "missing
+    # peer" this module can actually detect.
+    warnings = lib.optionals (cfg.enable && droppedPeers != [ ]) [
+      ''
+        nixaudio.fabric: nixnet declared peer(s) ${lib.concatStringsSep ", " droppedPeers} with no
+        published hostnames, so they were dropped from nixaudio.fabric.peers instead of joining the
+        audio pool. If that is unexpected, the gap is in nixnet's configuration, not this module's.
+      ''
+    ];
+
     assertions = lib.optionals cfg.enable [
       {
         assertion = cfg.peers != { };
@@ -261,6 +305,10 @@ in
           Peers default to config.nixnet.peers. If nixnet is not composed on this host, either add it
           (preferred — it brings LAN/overlay failover, so the fabric survives a roaming host) or set
           nixaudio.fabric.peers explicitly.
+
+          This assertion only catches TOTAL loss (zero peers). A host missing from nixnet's OWN peer
+          table is invisible to it -- see the README's "What deriving from nixnet does and does not
+          guarantee".
         '';
       }
       {

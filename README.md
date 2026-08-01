@@ -3,20 +3,32 @@
 **Audio as one declared fleet-wide fact: stable device names drawn from the shared USB inventory,
 and a many-to-many cross-host device pool addressed by name rather than by address.**
 
-Status: **early.** The device-naming layer, the fabric policy, the stable-name catalogue, the
+Status: **composed and running on one host of a three-host fleet; the remaining two are configured
+but not yet activated.** The device-naming layer, the fabric policy, the stable-name catalogue, the
 packaged daemon, the health check, all three planes and the evaluation checks are complete and
-proven. Not yet cut over on any live host — see *Migration* below, which has a breaking consequence
-worth reading before you switch.
+proven. The fabric itself is **not yet symmetric in production** — only one host has actually
+adopted it, so there is nobody there yet to mirror — and before assuming symmetry alone will make it
+correct once the other two switch, read *What deriving from nixnet does and does not guarantee*
+below. See *Migration* below for the breaking consequence worth reading before that switch.
 
-**Not hypothetical — this is the exact failure this repo was written to remove.** An earlier
-deployment of this same pattern, hand-placed rather than declared, showed it happen for real across
+**Not hypothetical — a version of this failure has now happened twice, from two different causes.**
+An earlier deployment of this same pattern, hand-placed rather than declared, showed it happen across
 three hosts on one fleet: two of the three, call them `host-b` and `host-c`, had each other in their
 peer tables and mirrored each other bidirectionally, each watching the other over a live `pactl
 subscribe`. But the third, `host-a`, had `host-b` and `host-c` in ITS table and mirrored both of
 them; **neither `host-b` nor `host-c` had `host-a` in THEIRS**, because their hardcoded IP tables
 were never updated when the third host joined. So `host-a` could *hear* the fleet but nothing could
-*hear it* — exactly the failure mode nixnet-derived peers (§ below) exists to remove, and the actual
-case that motivated replacing `FABRIC_NODES`, not a hypothetical one.
+*hear it* — the actual case that motivated replacing `FABRIC_NODES` with nixnet-derived peers (§
+below), not a hypothetical one.
+
+Deriving peers from nixnet removes that specific cause — there is no longer a second, hand-maintained
+table to forget. But on the day this module was first composed onto a real host, the same *symptom*
+showed up again from a different cause: nixnet's own peer table on that host was itself incomplete —
+one fleet machine simply was not a peer there yet — so the fabric peer list derived from it inherited
+exactly the same gap, and that machine stayed unreachable. Centralising the peer list did not make the
+list complete; it made there be exactly one place to fix instead of two. See *What deriving from
+nixnet does and does not guarantee* below for what that promise actually covers, and what it never
+did.
 
 ## The goal
 
@@ -60,8 +72,45 @@ addressed **by name**:
 nixaudio.fabric.peers    # defaults to config.nixnet.peers, addressed by published hostname
 ```
 
-Adding a host to the fleet adds it to the audio pool. There is no second list to keep in sync, and
-no way for a host to be present in one and missing from the other.
+Adding a host to nixnet's peer table adds it to the audio pool automatically. There is no second list
+to hand-maintain — see immediately below for exactly what that guarantee does, and does not, cover.
+
+### What deriving from nixnet does and does not guarantee
+
+The real, worthwhile benefit: there is exactly ONE peer table for the whole audio fabric, not one per
+host cross-referencing hand-copied IPs. Fix a host's peer status in nixnet and every consumer of
+`config.nixnet.peers` — this module included — picks it up on the next rebuild, with nothing here to
+edit or forget.
+
+What it does NOT buy, and what an earlier draft of this README overstated: this module's peer list is
+exactly as complete as nixnet's own peer table on THIS host, no more. If a host is missing from
+`config.nixnet.peers` — nixnet not composed there, or composed but that peer never actually joined
+nixnet's own view of the fleet — nixaudio has no way to know that host should exist. It derives an
+empty gap from an empty gap. This is not hypothetical: it is exactly what happened in production the
+day this module was first composed onto a real host (see above). Deriving from a single source
+doesn't make that source correct; it centralises WHERE correctness has to be maintained, from N
+places down to one. That is the actual claim, and it is a real one — "no second list to drift apart
+from" is true and useful — but "no way for a host to be silently missing" was not, and this file no
+longer says it.
+
+Can eval time catch it? Partly, because two different failure shapes hide behind "a host is missing":
+
+- **A host absent from `nixnet.peers` entirely.** Invisible here, structurally: this module's
+  evaluation happens on one host with no knowledge of the fleet beyond what `config.nixnet.peers`
+  already says on that host. There is no live network probe at eval time, and even if there were,
+  "which hosts SHOULD exist" is not a fact Nix evaluation can derive from nothing. Catching this needs
+  a check on nixnet's own side (does its peer table match some independent fleet inventory?), not
+  here — a pure function of one host's config cannot audit a list it was only ever given, not asked to
+  verify.
+- **A host `nixnet.peers` DOES know about, but with no hostname published for it.** This one IS
+  visible at eval time: it shows up as an attrset key with `hostnames == [ ]`. Silently filtering it
+  out of the derived peer set (which the code already did) would repeat the exact "quietly missing"
+  mistake one layer up, so it no longer does that silently — dropping such a peer now raises a
+  `nixaudio.fabric` warning naming it, checked in `checks/default.nix`. The existing
+  `cfg.peers != { }` assertion still catches the total-loss case (every peer dropped, or none ever
+  declared) as a hard failure — see *Isolation and default-sink safety* onward for how the rest of
+  this module treats "detectable at eval time" versus "only knowable live" as two different kinds of
+  fact throughout, not just here.
 
 Device identity is [`nixusb`](https://github.com/julian-corbet/nixusb-corbet-ch)'s. USB devices are
 not declared here at all — they are tagged in the shared inventory and derived:
