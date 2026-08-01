@@ -1,0 +1,9 @@
+result
+result-*
+
+# Cloudflare wrangler local cache (holds account id + name — never commit)
+.wrangler/
+
+# Python bytecode cache — embeds the compiler's absolute source path, never commit
+__pycache__/
+*.pyc

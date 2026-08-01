@@ -1,0 +1,409 @@
+# nixaudio.devices — give every audio device a stable name the whole fleet agrees on.
+#
+# WHY THIS IS NOT JUST COSMETIC
+#
+# PipeWire's own node names embed the machine's USB topology:
+#
+#   alsa_card.usb-HP__Inc_HyperX_Cloud_III_S_Wireless_C1V51706C2-00.2
+#   api.alsa.path = hw:1
+#   device.bus-path = pci-0000:00:14.0-usb-0:1.2.4:1.0
+#
+# The `hw:N` index depends on enumeration order, and the bus-path depends on which physical port the
+# device is in. Move a headset from a laptop port to a dock port, or plug it into a different host,
+# and both change. Anything downstream that pinned one of those strings silently stops resolving.
+#
+# That matters here more than usual, because the fabric's whole point is that a device on ANY host is
+# reachable from EVERY host. A sink reference that only resolves on the machine the device happens to
+# be plugged into defeats the exercise.
+#
+# ── WHAT IS ACTUALLY STABLE ─────────────────────────────────────────────────────────────────────
+#
+# Verified live against `pw-dump` on a real device rather than assumed:
+#
+#   device.vendor.id   = 0x03f0     <- stable, note the 0x prefix and lowercase hex
+#   device.product.id  = 0x06be     <- stable
+#   device.bus-id      = usb-HP__Inc_HyperX_Cloud_III_S_Wireless_C1V51706C2-00   <- stable, carries serial
+#   device.serial      = HP__Inc_HyperX_Cloud_III_S_Wireless_C1V51706C2          <- mangled, NOT the raw serial
+#   api.alsa.path      = hw:1       <- UNSTABLE, enumeration order
+#   device.bus-path    = pci-...    <- UNSTABLE, physical port
+#
+# So the rules generated here match on vendor+product id, optionally narrowed by a substring match on
+# `device.bus-id` when two units of one model must be told apart. Note `device.serial` is NOT the raw
+# USB serial — PipeWire prefixes it with the manufacturer and product strings and mangles spaces to
+# underscores — which is exactly the sort of thing that has to be checked rather than guessed.
+#
+# ── WHERE THE DEVICE LIST COMES FROM ────────────────────────────────────────────────────────────
+#
+# USB devices are not re-declared here. They come from `nixusb.devices` — the fleet's single USB
+# inventory — filtered to those carrying the `audio` tag. Read defensively so nixusb stays an
+# optional input: a host that has not adopted nixusb simply contributes nothing, and can still
+# declare non-USB devices (an internal PCI codec, a virtual sink) through `nixaudio.devices` directly.
+#
+# ── WINNING THE DEFAULT-SINK / DEFAULT-SOURCE RACE ──────────────────────────────────────────────
+#
+# The live defect this exists to fix: a HyperX headset and a Shure studio interface, both plugged
+# into the same host, both carry PipeWire's own ALSA-monitor-assigned `priority.session = 1109` for
+# their sinks — verified live with `pw-dump`, an exact tie. WirePlumber's default-node picker breaks
+# a tie by whichever enumerated last, which is exactly the `hw:N`/enumeration-order instability this
+# module's whole naming scheme already exists to route around (see above). The other reported cause,
+# a stale WirePlumber state file remembering an old default by NAME, is a second way the same
+# symptom shows up — and it is exactly why `nixaudio.priorities` (below) matches on vendor/product
+# id through the identical mechanism `nixaudio.devices`/`fromUsb` already use, never on a node name
+# or description a stale state file could have cached.
+#
+# `nixaudio.priorities.<name>` lets a device explicitly outrank a rival instead of gambling on
+# enumeration order. It is deliberately NOT part of `nixaudio.devices` or projected from
+# `nixusb.devices`: it has to apply equally to a usb-derived device (which carries no field for it —
+# nixusb's own schema is not this repo's to extend) and an explicitly-declared one, so it is its own
+# small overlay, keyed by the same stable NAME `fromUsb`/`explicitDevices` already assign, applied
+# after device identity is resolved rather than folded into how identity is declared.
+#
+# THIS IS A TIE-BREAKER, NOT A ROUTE PIN. `modules/fabric.nix`'s header ("ROUTING INTENT IS STATE,
+# NOT CONFIGURATION") draws this line for the fabric's own default-priority knob and it applies here
+# unmodified: this only ever affects an UNOPINIONATED app willing to accept whatever PipeWire
+# currently calls the default. The moment an app pins a sink explicitly, or a human moves the
+# default with `wpctl set-default`/`pw-link`, that live choice wins exactly as it would with no
+# priority declared at all — a rebuild does not, and must not, reach into the running graph and force
+# a stream to move.
+#
+# SINK AND SOURCE ARE INDEPENDENT because one physical device is routinely both, with opposite
+# rankings. The defect this fixes IS that shape: a headset with good speakers and an acceptable mic
+# should not have to lose default-source to a studio interface with a genuinely better mic just
+# because that interface also exposes a sink nobody listens on. "Best speakers, worst microphone" is
+# a legitimate preference a single number cannot express, so `priority.sink` and `priority.source`
+# are two independently-settable fields, never one.
+#
+# NUMBER SPACE: positive integers only (`>= 1`), no declared ceiling.
+#   - Zero and below are refused by the option's own type, on purpose. `modules/fabric.nix`'s
+#     `mirrorPriorityConfig` stamps `priority.session = 0` onto every mirrored fabric node so real
+#     hardware always wins the default-node race against a tunnel (see that module's header). A
+#     locally-declared priority of 0 would tie a piece of REAL hardware with a DEPRIORITISED MIRROR —
+#     the exact failure that scheme exists to prevent — so this option cannot express it at all,
+#     rather than relying on every caller to remember not to.
+#   - No ceiling is declared because PipeWire's own ALSA-monitor-assigned `priority.session` for real
+#     hardware is not a fixed, documented range: verified live across this fleet's own devices it
+#     spans at least 664 (an HDMI output nobody wants first) to 2100 (a muted fallback microphone),
+#     profile- and port-dependent, with nothing upstream promising that ceiling won't move the next
+#     time a device or profile is added. `priority` only ever has to outrank whatever number the
+#     SPECIFIC rival it is weighed against currently carries — a judgment call for whoever declares
+#     it, not a global maximum this module would have to guess and could already be wrong about.
+#   - Only `priority.session` is rendered, never `priority.driver`: the latter governs which
+#     driver-capable node becomes the graph's clock source, an orthogonal concern from which node
+#     `wpctl`/an app's "default" points at, and not what either the reported defect or this option is
+#     about.
+{ lib, config, ... }:
+let
+  cfg = config.nixaudio;
+
+  # Defensive read — the idiom nixhost already uses for nixnet.interfaces. nixusb is a soft
+  # dependency: if it is absent, `or { }` keeps evaluation working instead of exploding.
+  usbDevices = config.nixusb.devices or { };
+
+  audioUsbDevices = lib.filterAttrs
+    (_: device: builtins.elem cfg.usbTag device.tags)
+    usbDevices;
+
+  # Project a nixusb entry onto a nixaudio device. The `0x` prefix is PipeWire's, not nixusb's --
+  # nixusb stores bare hex because that is what udev's ATTRS{idVendor} uses. Translating between the
+  # two representations is precisely this module's job.
+  #
+  # `source` is not cosmetic: it is what modules/catalogue.nix uses to decide which of THIS host's
+  # devices it may assume also exist, by the same name, on a PEER host it has never evaluated.
+  # nixusb.devices is the fleet's single inventory (one declaration, composed unchanged wherever
+  # nixusb is imported -- see the README), so a "usb" entry is fleet-shared vocabulary; an
+  # "explicit" entry is this host's own hand-declared hardware (a PCI codec, a virtual sink) that no
+  # other host's config has any way of knowing about. Conflating the two would let the catalogue
+  # claim a peer has a device that is actually only wired into THIS box.
+  fromUsb = name: device: {
+    inherit name;
+    description = if device.description != "" then device.description else name;
+    source = "usb";
+    match = {
+      "device.vendor.id" = "0x${device.vendorId}";
+      "device.product.id" = "0x${device.productId}";
+    } // lib.optionalAttrs (device.serial != null) {
+      # `~` makes this a regex in WirePlumber's rule matcher. bus-id embeds the USB serial but also
+      # the manufacturer and product strings, so an exact match would be brittle -- a substring match
+      # on the serial is both stable and sufficient to disambiguate two units of one model.
+      "device.bus-id" = "~.*${device.serial}.*";
+    };
+  };
+
+  derivedDevices = lib.mapAttrsToList fromUsb audioUsbDevices;
+
+  explicitDevices = lib.mapAttrsToList
+    (name: device: {
+      inherit name;
+      description = if device.description != "" then device.description else name;
+      source = "explicit";
+      match = device.match;
+    })
+    cfg.devices;
+
+  allDevices = derivedDevices ++ explicitDevices;
+
+  # No override declared for this device: `null` on both axes means "leave WirePlumber's own
+  # ALSA-monitor heuristic alone", i.e. render no priority.session rule at all for it (see
+  # priorityRulesFor). This is the default every device gets unless named in `cfg.priorities`.
+  noPriority = { sink = null; source = null; };
+
+  # Layer the priority overlay onto the identity `fromUsb`/`explicitDevices` already resolved, keyed
+  # by the same stable NAME -- see this file's header for why priority is not folded into either of
+  # those instead. Every consumer downstream (rule generation, `nixaudio.resolvedDevices`) reads this
+  # list, never `allDevices` directly, so `priority` is never missing where identity is present.
+  resolvedDevices = map
+    (device: device // { priority = cfg.priorities.${device.name} or noPriority; })
+    allDevices;
+
+  # A priority declared for a name nothing resolves to is a typo, or a device this host does not
+  # actually compose (a nixusb tag never applied, a name that does not match `nixaudio.devices`) --
+  # exactly the class of mistake `duplicateNames` below catches for the reverse case (two devices,
+  # one name); this is one name, zero devices.
+  unknownPriorityNames =
+    lib.subtractLists (map (d: d.name) allDevices) (lib.attrNames cfg.priorities);
+
+  # WirePlumber 0.5 rule syntax (SPA-JSON). One rule per device: match on the stable identity, then
+  # stamp the name we chose onto device.description and node.nick so it shows up that way everywhere,
+  # including in the tunnel descriptions peers see when this device is mirrored.
+  mkRule = device: ''
+    {
+      matches = [
+        {
+    ${lib.concatStringsSep "\n" (lib.mapAttrsToList
+      (key: value: "        ${key} = \"${value}\"")
+      device.match)}
+        }
+      ]
+      actions = {
+        update-props = {
+          device.description = "${device.description}"
+          device.nick = "${device.name}"
+          node.nick = "${device.name}"
+        }
+      }
+    }'';
+
+  # Same identity matcher as mkRule, narrowed to just the sink or just the source node a device
+  # spawns via `media.class` -- the PipeWire-assigned node property that tells the two apart
+  # ("Audio/Sink" / "Audio/Source"). The ALSA *device* object itself carries "Audio/Device" and so
+  # never matches either, which is what keeps this rule from also stamping priority.session onto the
+  # device object mkRule above updates -- device objects have no priority.session to begin with, only
+  # the sink/source nodes spawned under them do.
+  mkPriorityRule = device: mediaClass: value: ''
+    {
+      matches = [
+        {
+    ${lib.concatStringsSep "\n" (lib.mapAttrsToList
+      (key: value: "        ${key} = \"${value}\"")
+      device.match)}
+          media.class = "${mediaClass}"
+        }
+      ]
+      actions = {
+        update-props = {
+          priority.session = ${toString value}
+        }
+      }
+    }'';
+
+  # Zero, one or two extra rules per device -- sink and source are independent, so either, both or
+  # neither may be declared (see this file's header for why one number cannot express both).
+  priorityRulesFor = device:
+    lib.optional (device.priority.sink != null) (mkPriorityRule device "Audio/Sink" device.priority.sink)
+    ++ lib.optional (device.priority.source != null) (mkPriorityRule device "Audio/Source" device.priority.source);
+
+  namingConfig = ''
+    # Generated by nixaudio.devices -- do not edit.
+    #
+    # Matches on vendor/product id (and bus-id where a serial disambiguates two units of one model),
+    # never on api.alsa.path or device.bus-path, both of which change when the device moves ports or
+    # the enumeration order shifts. Priority overrides (nixaudio.priorities) reuse this identical
+    # matcher, narrowed to the sink or source node with media.class -- a node.name or
+    # device.description string is exactly what a stale WirePlumber state file gets wrong, so
+    # priority is pinned to hardware identity here too, never to a name.
+    monitor.alsa.rules = [
+    ${lib.concatStringsSep "\n" (lib.concatMap (device: [ (mkRule device) ] ++ priorityRulesFor device) resolvedDevices)}
+    ]
+  '';
+
+  duplicateNames =
+    let
+      names = map (d: d.name) resolvedDevices;
+      counts = lib.groupBy lib.id names;
+    in
+    lib.attrNames (lib.filterAttrs (_: v: builtins.length v > 1) counts);
+in
+{
+  options.nixaudio = {
+    usbTag = lib.mkOption {
+      type = lib.types.str;
+      default = "audio";
+      description = ''
+        Which `nixusb.devices.<name>.tags` entry marks a USB device as an audio device this module
+        should name.
+
+        nixusb assigns no meaning to any tag — each consumer defines its own vocabulary — so this is
+        nixaudio declaring which word it answers to, rather than a convention nixusb imposes.
+      '';
+    };
+
+    devices = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+        options = {
+          description = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = ''
+              Human-readable description shown in mixers and, crucially, in the tunnel descriptions
+              peers see when this device is mirrored across the fabric. Defaults to the attribute name.
+            '';
+          };
+
+          match = lib.mkOption {
+            type = lib.types.attrsOf lib.types.str;
+            example = lib.literalExpression ''
+              {
+                "device.name" = "alsa_card.pci-0000_00_1f.3-platform-skl_hda_dsp_generic";
+              }
+            '';
+            description = ''
+              PipeWire device properties to match on, as a WirePlumber rule matcher. Prefix a value
+              with `~` to make it a regex.
+
+              Use properties that survive a replug and a reboot. Verified stable: `device.vendor.id`
+              (note the `0x` prefix), `device.product.id`, `device.bus-id`, and for fixed internal
+              hardware `device.name` with its PCI path. Verified UNSTABLE, do not use:
+              `api.alsa.path` (`hw:N`, enumeration order) and `device.bus-path` (physical port).
+
+              USB devices should not be declared here at all — tag them in `nixusb.devices` instead
+              and they are derived automatically, which keeps one inventory rather than two.
+            '';
+          };
+        };
+
+        config.description = lib.mkDefault name;
+      }));
+      default = { };
+      description = ''
+        Audio devices declared directly, for anything that is not a tagged USB device — an internal
+        PCI codec, a virtual sink, a device on a bus nixusb does not cover.
+
+        USB devices come from `nixusb.devices` automatically and must not be repeated here.
+      '';
+    };
+
+    priorities = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          sink = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.positive;
+            default = null;
+            example = 2000;
+            description = ''
+              `priority.session` this device's SINK (playback) node should carry, overriding
+              whatever WirePlumber's ALSA monitor would otherwise assign it. `null` (the default)
+              leaves that heuristic alone.
+
+              A tie-breaker for an unopinionated app's default-sink pick, never a route: see this
+              file's header, and `modules/fabric.nix`'s "ROUTING INTENT IS STATE, NOT CONFIGURATION"
+              — the moment any app or a human pins a sink explicitly, that live choice wins over
+              this regardless of the number here.
+
+              Must be a positive integer (`>= 1`); the type itself refuses 0 and below, because 0 is
+              what `modules/fabric.nix`'s `mirrorPriorityConfig` stamps onto a deprioritised mirror,
+              and a local device tied with that would defeat the whole point of that scheme.
+            '';
+          };
+
+          source = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.positive;
+            default = null;
+            example = 2000;
+            description = ''
+              `priority.session` this device's SOURCE (capture) node should carry. Same tie-breaker
+              semantics and number space as `sink` above, but set independently — see this file's
+              header for why one device's best output and best input are not always the same unit.
+            '';
+          };
+        };
+      });
+      default = { };
+      example = lib.literalExpression ''
+        {
+          hyperx.sink = 2000;    # outrank the Shure interface's tied 1109 for playback
+          shure.source = 2200;   # but let the Shure interface still win the microphone
+        }
+      '';
+      description = ''
+        Default-sink / default-source priority overrides, by the same stable device NAME
+        `nixaudio.devices` / the derived `nixusb.devices` entries already use — never a card index,
+        a `hw:N` path, or a display name, all of which either change on replug or are exactly what a
+        stale WirePlumber state file gets wrong (the live defect this option exists to fix). Sink and
+        source are independent fields on the same device, because a device is routinely both with
+        opposite rankings — see this file's header for the full rationale and the chosen number
+        space.
+
+        A name declared here that no device on this host resolves to (a typo, or a device this host
+        does not actually compose) is rejected by an assertion rather than silently doing nothing.
+      '';
+    };
+
+    namingConfig = lib.mkOption {
+      type = lib.types.lines;
+      internal = true;
+      readOnly = true;
+      description = "Generated WirePlumber naming rules, consumed by whichever plane is in use.";
+    };
+
+    resolvedDevices = lib.mkOption {
+      type = lib.types.listOf lib.types.unspecified;
+      internal = true;
+      readOnly = true;
+      description = ''
+        The merged device list (derived-from-nixusb plus explicitly declared), exposed so the fabric
+        module and health checks can reason about what this host is expected to publish without
+        recomputing the projection.
+
+        Each entry carries `source`: `"usb"` for a device derived from `nixusb.devices` (the fleet's
+        single inventory, so the same name is assumed to apply wherever nixusb is composed) or
+        `"explicit"` for one declared directly in `nixaudio.devices` on this host only. See
+        `nixaudio.fabric.catalogue`, the consumer this distinction exists for.
+
+        Each entry also carries `priority`, a `{ sink; source; }` record -- `nixaudio.priorities`'s
+        entry for this device's name if one exists, `{ sink = null; source = null; }` otherwise. This
+        is a name-keyed overlay applied after identity is resolved, not a field either `nixusb` or
+        `nixaudio.devices` carries directly; see this file's header for why.
+      '';
+    };
+  };
+
+  config = {
+    nixaudio.namingConfig = namingConfig;
+    nixaudio.resolvedDevices = resolvedDevices;
+
+    assertions = [
+      {
+        assertion = duplicateNames == [ ];
+        message = ''
+          nixaudio: more than one audio device resolves to the same name: ${lib.concatStringsSep ", " duplicateNames}
+
+          A name collides either because two nixusb devices tagged "${cfg.usbTag}" share an attribute
+          name, or because nixaudio.devices redeclares a device that nixusb already provides. USB
+          devices must be declared in exactly one place — tag them in nixusb.devices and let this
+          module derive them, rather than restating them here.
+        '';
+      }
+      {
+        assertion = unknownPriorityNames == [ ];
+        message = ''
+          nixaudio: nixaudio.priorities declares a priority for a device name this host does not
+          resolve: ${lib.concatStringsSep ", " unknownPriorityNames}
+
+          Priority names live in the same namespace as nixaudio.resolvedDevices' own names -- a
+          nixaudio.devices attribute name, or a nixusb.devices entry tagged "${cfg.usbTag}". Check
+          for a typo, or that the device is actually composed on this host.
+        '';
+      }
+    ];
+  };
+}
