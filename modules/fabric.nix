@@ -96,32 +96,46 @@ let
   droppedPeers = lib.attrNames (lib.filterAttrs (_: peer: peer.hostnames == [ ]) nixnetPeers);
 
   # A GENERAL defence against the failure class this option is the textbook example of (see the
-  # `peers` option's own description, and README's incident writeup): `lib.mkDefault derivedPeers`
+  # `peers` option's own description, and README's incident writeup): `lib.mkDefault expectedPeers`
   # below is ONE definition of the whole attrset, so a consumer that writes a NESTED, dotted-path
   # definition -- `nixaudio.fabric.peers.<name>.host = "...";`, rather than the whole `peers =
   # {...}` -- sits at normal priority and wins the OPTION-level priority filter outright. That
-  # discards `lib.mkDefault derivedPeers` in its entirety, not just the key the nested definition
+  # discards `lib.mkDefault expectedPeers` in its entirety, not just the key the nested definition
   # touched: `attrsOf` only ever merges per-key among definitions that already survived that
-  # filter. By the time `cfg.peers` is available here it is already the merged, final value, so
-  # there is no way to tell that shape of accident apart from a host deliberately writing the
-  # whole `peers = {...}` attrset as a reviewed, intentional STRICT SUBSET of the fleet (which the
-  # option's own description explicitly supports) -- both produce an effective set missing some
-  # member `derivedPeers`, recomputed fresh right here, could otherwise supply. So this can only
-  # ever be a warning, not an assertion: it fires on the deliberate-subset case too (a host that
-  # dials most of the fleet but excludes one peer on purpose, say), which is an acceptable false
-  # positive for a comment that costs nothing to read past, against catching the accidental one
-  # for free.
+  # filter. By the time `cfg.peers` is available here it is already the merged, final value.
+  #
+  # Compared against `expectedPeers` (post-`excludePeers`), NOT the raw `derivedPeers` -- a host
+  # using `excludePeers` correctly ends up with `cfg.peers == expectedPeers` exactly (nothing to
+  # warn about), while a host that instead reaches for a hand-written `peers = {...}` to drop a
+  # name -- the shape `excludePeers` exists to replace -- still produces an effective set missing
+  # something `expectedPeers` says should be there, so this still warns and still nudges toward the
+  # declarative option instead. There is no way to tell "wrote a whole `peers = {...}` on purpose,
+  # genuinely disjoint from the fleet" apart from "accidentally wrote a NESTED key and lost
+  # siblings" from `cfg.peers` alone -- both can produce an effective set that is a subset of what
+  # `expectedPeers` would supply. So this can only ever be a warning, not an assertion: an
+  # acceptable false positive on the former (a comment that costs nothing to read past, and a
+  # nudge toward `excludePeers` besides), against catching the latter for free.
   collapsedPeers =
     lib.optionals
-      (cfg.peers != { } && cfg.peers != derivedPeers
-        && lib.all (n: builtins.hasAttr n derivedPeers) (lib.attrNames cfg.peers))
-      (lib.subtractLists (lib.attrNames cfg.peers) (lib.attrNames derivedPeers));
+      (cfg.peers != { } && cfg.peers != expectedPeers
+        && lib.all (n: builtins.hasAttr n expectedPeers) (lib.attrNames cfg.peers))
+      (lib.subtractLists (lib.attrNames cfg.peers) (lib.attrNames expectedPeers));
 
   # A peer is addressed by the first name nixnet publishes for it. nixnet maintains the
   # name -> currently-winning-address mapping, so this stays correct as transports flap.
   derivedPeers = lib.mapAttrs
     (_: peer: { host = builtins.head peer.hostnames; })
     (lib.filterAttrs (_: peer: peer.hostnames != [ ]) nixnetPeers);
+
+  # The actual default: `derivedPeers`, minus any host named in `excludePeers`. Splitting this out
+  # from `derivedPeers` itself keeps `droppedPeers` above comparing against the FULL nixnet-derived
+  # set (an excluded peer was never "dropped" -- it was never wanted) while giving `excludePeers` a
+  # declarative way to keep a permanent exclusion (a peer that genuinely should never join the
+  # audio pool -- a service host running no PipeWire, say) LIVE against nixnet's table, rather than
+  # needing a consumer to hand-copy `derivedPeers`' whole shape just to drop one name from it. See
+  # the `excludePeers` option's own description for why this exists as a first-class mechanism
+  # instead of leaving "exclude one peer" to a wholesale `peers = {...}` rewrite.
+  expectedPeers = removeAttrs derivedPeers cfg.excludePeers;
 
   listenAddress =
     if cfg.listen.address == "any" then "0.0.0.0" else cfg.listen.address;
@@ -251,7 +265,32 @@ in
         is dropped from this default and raises a `warnings` entry naming it, rather than disappearing
         with no trace.
 
-        Set explicitly only to make the audio pool a strict subset of the fleet.
+        For a PERMANENT exclusion -- a peer that should never join the audio pool at all, a service
+        host running no PipeWire, say -- prefer `excludePeers` instead of writing the rest of this
+        attrset by hand: it keeps the derivation from `config.nixnet.peers` LIVE, so a future nixnet
+        peer still joins the pool automatically, which setting `peers` wholesale here does not (a
+        hand-typed attrset is a snapshot, not a subscription -- it has to be revisited by hand every
+        time the fleet's peer table changes). Set `peers` explicitly only for a one-off override this
+        host's own audio pool needs and `excludePeers` cannot express (an address nixnet does not
+        know, say).
+      '';
+    };
+
+    excludePeers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "mail-vps" ];
+      description = ''
+        Peer names to drop from the default `peers` derivation (`config.nixnet.peers`, filtered to
+        published names) -- the declarative alternative to writing `peers` by hand just to exclude
+        one name. Every OTHER nixnet peer, including one added after this host's config was last
+        touched, still joins the audio pool automatically; only the names listed here are held back.
+
+        This is deliberately a `listOf str`, not part of `peers` itself: `peers` stays a single
+        attrset a consumer can still set wholesale when that is genuinely what is needed (see that
+        option's own description), while a permanent exclusion is expressed as what it actually is
+        -- a name, not a replacement value -- and composes with the live derivation instead of
+        freezing it.
       '';
     };
 
@@ -293,7 +332,7 @@ in
   };
 
   config = {
-    nixaudio.fabric.peers = lib.mkDefault derivedPeers;
+    nixaudio.fabric.peers = lib.mkDefault expectedPeers;
 
     nixaudio.fabric.pipewireConfig = lib.mkIf cfg.enable {
       "50-fabric-loops" = loopConfig;
@@ -319,14 +358,15 @@ in
     ] ++ lib.optionals (cfg.enable && collapsedPeers != [ ]) [
       ''
         nixaudio.fabric.peers is missing ${lib.concatStringsSep ", " collapsedPeers}, which
-        config.nixnet.peers can still derive right now. If nixaudio.fabric.peers was set to a
-        deliberate, reviewed subset of the fleet (a whole `peers = { ... };` attrset), this is
-        expected -- ignore it. If it was set by writing a NESTED key instead --
-        `nixaudio.fabric.peers.<name>.host = "...";` rather than the whole attrset -- this is the
-        bug documented on the `peers` option itself: that partial, dotted-path definition sits at
-        normal priority and silently discards the WHOLE `lib.mkDefault` derivation, not just the
-        key it touched, which is exactly how one fleet host's audio peers previously collapsed to
-        a single hand-written entry with no error at all.
+        config.nixnet.peers can still derive right now and nixaudio.fabric.excludePeers does not
+        name. If this host means to exclude ${lib.concatStringsSep ", " collapsedPeers} from the
+        audio pool permanently, add it to nixaudio.fabric.excludePeers instead of a hand-written
+        peers = { ... }; -- that stays correct as the fleet's peer table changes, this does not. If
+        the exclusion was NOT intentional, this is likely the bug documented on the `peers` option
+        itself: writing a NESTED key -- `nixaudio.fabric.peers.<name>.host = "...";` -- instead of
+        the whole attrset sits at normal priority and silently discards the WHOLE `lib.mkDefault`
+        derivation, not just the key it touched, which is exactly how one fleet host's audio peers
+        previously collapsed to a single hand-written entry with no error at all.
       ''
     ];
 

@@ -240,6 +240,38 @@ let
     }
   ];
 
+  # THE FOLLOW-UP FIX: `excludePeers` is the declarative way to drop a permanent, named peer from
+  # the pool while keeping the derivation from nixnet LIVE (a future nixnet peer still joins
+  # automatically). A host using it correctly must see cfg.peers exactly equal the exclude-aware
+  # derivation, and -- the whole point -- raise NO collapse warning, unlike the hand-written
+  # `peers = {...}` shape it replaces.
+  excludePeersUsed = eval [
+    nixusbStub
+    nixnetStub
+    {
+      nixnet.peers.host-a.hostnames = [ "host-a" ];
+      nixnet.peers.host-b.hostnames = [ "host-b" ];
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.excludePeers = [ "host-b" ];
+    }
+  ];
+
+  # The OLD shape `excludePeers` exists to replace, still exercised: a hand-written wholesale
+  # `peers = {...}` that drops a peer nixnet could still derive must still warn -- excludePeers
+  # existing does not make this case stop being suspicious, it makes it stop being NECESSARY.
+  manualExcludeInsteadOfOption = eval [
+    nixusbStub
+    nixnetStub
+    {
+      nixnet.peers.host-a.hostnames = [ "host-a" ];
+      nixnet.peers.host-b.hostnames = [ "host-b" ];
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers = { host-a.host = "host-a"; };
+    }
+  ];
+
   rtOk = eval [
     nixiamStub
     { nixiam.posix.deviceGroups.audio = 403; nixaudio.rt.enable = true; }
@@ -383,6 +415,28 @@ let
     {
       name = "the collapse warning does not fire on manyPeers either (no override at all)";
       ok = manyPeers.config.warnings == [ ];
+    }
+    {
+      name = "excludePeers actually drops the named peer from cfg.peers";
+      ok = lib.attrNames excludePeersUsed.config.nixaudio.fabric.peers == [ "host-a" ];
+    }
+    {
+      name = "excludePeers keeps the derivation live: an unexcluded peer still joins automatically";
+      ok = excludePeersUsed.config.nixaudio.fabric.peers.host-a.host == "host-a";
+    }
+    {
+      name = "using excludePeers correctly raises NO collapse warning -- the whole point of the follow-up fix";
+      ok = excludePeersUsed.config.warnings == [ ];
+    }
+    {
+      name = "the hand-written shape excludePeers replaces still warns -- excludePeers existing does not silence a genuine accident";
+      ok =
+        let w = manualExcludeInsteadOfOption.config.warnings;
+        in builtins.length w == 1 && lib.hasInfix "host-b" (builtins.head w);
+    }
+    {
+      name = "...and that warning actively points at excludePeers as the fix";
+      ok = lib.hasInfix "excludePeers" (builtins.head manualExcludeInsteadOfOption.config.warnings);
     }
     {
       name = "the listener binds the address given, never a silent 0.0.0.0";
