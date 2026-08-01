@@ -221,6 +221,25 @@ let
     }
   ];
 
+  # THE BUG THIS DEFENSE IS FOR: nixnet derives TWO peers, but the fixture pins ONE of them via a
+  # NESTED, dotted-path definition (`peers.host-a.host = ...`) instead of the whole `peers = {...}`
+  # attrset -- the exact shape that collapsed one fleet host's audio peers to a single hand-written
+  # entry with no error. `cfg.peers` itself is UNCHANGED by the new defense (that would require
+  # rewriting the option's merge semantics, which would break the legitimate "explicit peers is a
+  # deliberate strict subset" case -- see `homePlane`, above, and the `peers` option's own
+  # description); what this fixture proves is that the module now NAMES the gap in `warnings`.
+  partialOverrideCollapse = eval [
+    nixusbStub
+    nixnetStub
+    {
+      nixnet.peers.host-a.hostnames = [ "host-a" ];
+      nixnet.peers.host-b.hostnames = [ "host-b" ];
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.host-a.host = "host-a";
+    }
+  ];
+
   rtOk = eval [
     nixiamStub
     { nixiam.posix.deviceGroups.audio = 403; nixaudio.rt.enable = true; }
@@ -346,6 +365,24 @@ let
     {
       name = "a partial peer raises a warning, not an assertion -- eval succeeds with the healthy peer still usable";
       ok = failed partialPeers == [ ];
+    }
+    {
+      name = "a nested-key partial override still collapses cfg.peers to just the hand-written entry (the bug itself, unchanged by the defense)";
+      ok = lib.attrNames partialOverrideCollapse.config.nixaudio.fabric.peers == [ "host-a" ];
+    }
+    {
+      name = "...but is no longer silent: a warning names the peer nixnet could still derive";
+      ok =
+        let w = partialOverrideCollapse.config.warnings;
+        in builtins.length w == 1 && lib.hasInfix "host-b" (builtins.head w);
+    }
+    {
+      name = "the collapse warning does not fire on a healthy, fully-derived fixture";
+      ok = composed.config.warnings == [ ];
+    }
+    {
+      name = "the collapse warning does not fire on manyPeers either (no override at all)";
+      ok = manyPeers.config.warnings == [ ];
     }
     {
       name = "the listener binds the address given, never a silent 0.0.0.0";

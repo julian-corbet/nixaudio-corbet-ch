@@ -95,6 +95,28 @@ let
   # warning (config.warnings, below) instead of dropped silently.
   droppedPeers = lib.attrNames (lib.filterAttrs (_: peer: peer.hostnames == [ ]) nixnetPeers);
 
+  # A GENERAL defence against the failure class this option is the textbook example of (see the
+  # `peers` option's own description, and README's incident writeup): `lib.mkDefault derivedPeers`
+  # below is ONE definition of the whole attrset, so a consumer that writes a NESTED, dotted-path
+  # definition -- `nixaudio.fabric.peers.<name>.host = "...";`, rather than the whole `peers =
+  # {...}` -- sits at normal priority and wins the OPTION-level priority filter outright. That
+  # discards `lib.mkDefault derivedPeers` in its entirety, not just the key the nested definition
+  # touched: `attrsOf` only ever merges per-key among definitions that already survived that
+  # filter. By the time `cfg.peers` is available here it is already the merged, final value, so
+  # there is no way to tell that shape of accident apart from a host deliberately writing the
+  # whole `peers = {...}` attrset as a reviewed, intentional STRICT SUBSET of the fleet (which the
+  # option's own description explicitly supports) -- both produce an effective set missing some
+  # member `derivedPeers`, recomputed fresh right here, could otherwise supply. So this can only
+  # ever be a warning, not an assertion: it fires on the deliberate-subset case too (a host that
+  # dials most of the fleet but excludes one peer on purpose, say), which is an acceptable false
+  # positive for a comment that costs nothing to read past, against catching the accidental one
+  # for free.
+  collapsedPeers =
+    lib.optionals
+      (cfg.peers != { } && cfg.peers != derivedPeers
+        && lib.all (n: builtins.hasAttr n derivedPeers) (lib.attrNames cfg.peers))
+      (lib.subtractLists (lib.attrNames cfg.peers) (lib.attrNames derivedPeers));
+
   # A peer is addressed by the first name nixnet publishes for it. nixnet maintains the
   # name -> currently-winning-address mapping, so this stays correct as transports flap.
   derivedPeers = lib.mapAttrs
@@ -293,6 +315,18 @@ in
         nixaudio.fabric: nixnet declared peer(s) ${lib.concatStringsSep ", " droppedPeers} with no
         published hostnames, so they were dropped from nixaudio.fabric.peers instead of joining the
         audio pool. If that is unexpected, the gap is in nixnet's configuration, not this module's.
+      ''
+    ] ++ lib.optionals (cfg.enable && collapsedPeers != [ ]) [
+      ''
+        nixaudio.fabric.peers is missing ${lib.concatStringsSep ", " collapsedPeers}, which
+        config.nixnet.peers can still derive right now. If nixaudio.fabric.peers was set to a
+        deliberate, reviewed subset of the fleet (a whole `peers = { ... };` attrset), this is
+        expected -- ignore it. If it was set by writing a NESTED key instead --
+        `nixaudio.fabric.peers.<name>.host = "...";` rather than the whole attrset -- this is the
+        bug documented on the `peers` option itself: that partial, dotted-path definition sits at
+        normal priority and silently discards the WHOLE `lib.mkDefault` derivation, not just the
+        key it touched, which is exactly how one fleet host's audio peers previously collapsed to
+        a single hand-written entry with no error at all.
       ''
     ];
 
