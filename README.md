@@ -270,11 +270,43 @@ no configuration described.
 Its logic was **not** rewritten. The debounced reconciler, the loop-guard, the deterministic tunnel
 naming, the data-loop pinning and the self-heal path are all load-bearing and proven in production;
 vendoring it and rewriting it are two different changes, and mixing them would make a regression
-impossible to attribute. The patch is +19 lines and touches only the config surface: the hardcoded
-`FABRIC_NODES` table, `PORT` and `FABRIC_LOOP` now come from a generated JSON file.
+impossible to attribute. The patch touches only the config surface: the peer table, `PORT` and
+`FABRIC_LOOP`, formerly hardcoded, now come from a generated JSON file.
 
 `nixaudio.fabric.daemon.settings` exposes that config as pure data, so a check can assert on it
 without import-from-derivation.
+
+### The peer table is re-read, not captured at startup
+
+Reading that file once, at import, was itself a bug — and a quiet one. Nothing restarts this unit
+when its config changes: `switch-to-configuration` does not restart running `systemd --user`
+services, and across a config-only change the unit file is byte-identical anyway, since only the
+`/etc` file it points at moved. So a daemon started before a peer was added kept mirroring the old
+peer set indefinitely, while every signal an operator would check said healthy — unit active, config
+on disk correct, heartbeat ticking.
+
+That is not hypothetical. One host ran twelve hours on a one-peer table that had been corrected two
+generations earlier, heartbeating `watching 1 peer(s)` throughout. What hid it is worth recording:
+the missing peer's devices *were* mirrored the whole time, by orphaned tunnels left behind by the
+retired hand-deployed daemon, which `module-tunnel-*` keeps reconnecting on its own every 15
+seconds. Nothing declarative owned them; the next PipeWire restart would have removed them for good,
+and this module would not have recreated them. The fabric looked right and was held together by
+garbage.
+
+So discovery reads the file rather than a snapshot of it. A peer added to the config joins on the
+next pass and a peer removed leaves, with the existing watcher teardown dropping its tunnels. An
+unreadable or half-written config keeps the last known-good table — an empty peer set reads as
+"every peer left the fabric" and would unload every tunnel on the host over a transient.
+
+Only the peer table refreshes. `PORT` and `FABRIC_LOOP` stay as read at startup, because every
+loaded tunnel carries both baked into its module arguments — applying them live would mean tearing
+down and rebuilding every tunnel, and they are also the two values that do not move in practice.
+
+This is the one thing here that cannot be checked by evaluation. "Does a running daemon notice its
+config changed" lives entirely in the gap between the generated file and what a long-lived process
+holds in memory, so `checks/daemon-peer-reload.py` executes the daemon's real discovery entry point
+against a config file rewritten underneath it, with a loopback listener behind the reachability
+probe rather than a stub — a stubbed probe can pass while the probe is what is broken.
 
 ## Health
 
