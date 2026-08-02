@@ -3,13 +3,16 @@
 **Audio as one declared fleet-wide fact: stable device names drawn from the shared USB inventory,
 and a many-to-many cross-host device pool addressed by name rather than by address.**
 
-Status: **composed and running on one host of a three-host fleet; the remaining two are configured
-but not yet activated.** The device-naming layer, the fabric policy, the stable-name catalogue, the
-packaged daemon, the health check, all three planes and the evaluation checks are complete and
-proven. The fabric itself is **not yet symmetric in production** — only one host has actually
-adopted it, so there is nobody there yet to mirror — and before assuming symmetry alone will make it
-correct once the other two switch, read *What deriving from nixnet does and does not guarantee*
-below. See *Migration* below for the breaking consequence worth reading before that switch.
+Status: **composed and running on all three hosts of the reference fleet, symmetric in production
+(2026-08-02).** The device-naming layer, the fabric policy, the stable-name catalogue, the packaged
+daemon, the health check, all three planes and the evaluation checks are complete and proven. Every
+host mirrors every other host's real devices — including a host with no local hardware of its own
+(a pure-software null sink, declared directly via `nixaudio.devices`-adjacent config rather than a
+USB-derived entry) and a host whose devices only exist because a co-resident container's kernel
+modules were loaded on its behalf. Before assuming symmetry alone makes a new host's join correct,
+read *What deriving from nixnet does and does not guarantee* below — it is still exactly as true
+now as when only one host had adopted this. See *Migration* below for the breaking consequence
+worth reading before any future switch.
 
 **Not hypothetical — a version of this failure has now happened twice, from two different causes.**
 An earlier deployment of this same pattern, hand-placed rather than declared, showed it happen across
