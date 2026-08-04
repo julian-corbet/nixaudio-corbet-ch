@@ -247,6 +247,61 @@ The pure modules are imported unchanged into all three trees. Only the projectio
 home-manager's units use the capitalised `Unit`/`Service`/`Install` shape, and a check asserts the
 home plane really produces that rather than NixOS's flat one, which would silently yield a broken unit.
 
+## The backend
+
+`nixaudio.backend` names the packages the rest of this module is written against. Until it existed,
+this module renamed devices it did not install a session manager to enumerate, and hung a TCP
+listener off a pulse layer it never asked anyone to install — survivable on NixOS by accident
+(`services.pipewire.*` brings the daemons with the policy), and not survivable on a host whose distro
+is not NixOS, where the system plane wrote config into `/etc` and assumed somebody had once run the
+right `pacman -S` by hand.
+
+The selection is not a menu. There is no host that wants PipeWire without its session manager, or a
+fabric listener with no pulse layer to host it — those are broken installs, not configurations. So
+one universal set, plus entries gated on a hardware fact nothing can derive:
+
+| entry | why it is in the backend |
+|---|---|
+| `pipewire` | the sound server |
+| `wireplumber` | the session/policy manager. Without it there are no device nodes and no routing, and the naming/priority rules this repo generates are never evaluated |
+| `pipewire-pulse` | **mandatory here specifically**: the fabric's own `module-native-protocol-tcp` listener is loaded into it, and the daemon reaches the graph through it |
+| `pipewire-alsa` | routes ALSA-native clients into PipeWire instead of letting one seize `hw:` exclusively and lock every other stream out of the card |
+| `pipewire-audio` | (Arch) card profiles + the Bluetooth codec set |
+| `pipewire-zeroconf` | **not what the fabric runs on** — this module routes its pool over `module-native-protocol-tcp`, and rejects zeroconf as a *transport* on the merits (below). Declared anyway, because the package is also RAOP/AirPlay discovery for third-party network sinks a host did not declare, which is a separate capability from the pool this module manages |
+| `alsa-utils` | diagnosis, and backend rather than desktop: `alsamixer` is the only way to see and clear a hardware mute switch PipeWire does not expose, and a muted ALSA control is silence no matter how correct the graph above it is |
+| `sof-firmware` | **gated, default off** — `backend.sofFirmware.enable`. Required on Intel DSP audio (`sof-hda-dsp`, `snd_sof_pci_intel_*`), where without it there is no sound at all. See the option's own description for why a host that shares the very same audio devices still does not need it: SOF is Intel-only, a container loads no firmware, and USB audio class devices need none |
+
+Deliberately **not** declared, recorded as data rather than as a comment so a check can enforce it:
+`alsa-plugins` (its pulse/jack plugins are what `pipewire-pulse` and PipeWire's JACK layer replace)
+and `alsa-firmware` (pre-DSP era cards, unrelated to SOF). Being useless *to the fabric* is not on
+that list and never was a reason on its own — see `pipewire-zeroconf` above.
+
+### The plane divide is not a package-name mapping
+
+On Arch the packages *are* the mechanism, so they must be installed. On NixOS there is nothing to
+name: `pipewire-pulse`, `pipewire-alsa`, `pipewire-audio`, `pipewire-zeroconf` and
+`alsa-card-profiles` do not exist as nixpkgs attributes at all. nixpkgs ships one `pipewire`
+derivation carrying the pulse binary, the `alsa-card-profile` profile sets, the `bluez5` plugin and
+`libpipewire-module-{zeroconf-discover,raop-discover,raop-sink}.so`, and the options switch on
+parts of it —
+`alsa.enable` writes `/etc/alsa/conf.d/*` pointing into that same package, `pulse.enable` un-masks
+its units. So the table names, per entry, *either* a nixpkgs attribute *or* the NixOS option that
+already provides it, never both.
+
+**We do not shadow.** On Arch every package comes from pacman — the distro's copy is first on `PATH`
+and is what actually runs, so a second nixpkgs copy of a *sound server* would leave which daemon the
+units, the udev rules and the ALSA plugin config point at ambiguous. On NixOS anything an option
+provides is never also installed as a package. Both directions are assertions, and checks prove the
+assertions are not vacuous.
+
+    # Arch: this module publishes names and installs nothing
+    nixarch.packages.pacman = config.nixaudio.backend.archPackages;
+    nixarch.packages.aur = config.nixaudio.backend.aurPackages;
+
+`backend.enable` defaults to `fabric.enable`, because the fabric is written against the backend and
+cannot work without it; the reverse — a host that wants its audio declared and joins no device pool
+— is a supported shape.
+
 ## Realtime
 
 `nixaudio.rt` writes the scheduling limits. Worth being precise about what was actually wrong on the
@@ -350,7 +405,15 @@ with a brief re-tunnel.
 
 `nix flake check` runs pure evaluation checks — no VM, no host. Both directions are proven: correct
 output generated, and rejected inputs actually rejected (a fabric with no peers, a device redeclared
-in two inventories).
+in two inventories, a fabric with its backend switched off, an entry claiming both a nixpkgs
+attribute and a NixOS option).
+
+They are also mutation-proven rather than merely green: giving `pipewire` a nixpkgs attribute
+alongside its option turns the anti-shadowing check red, dropping `alsa-utils` from the table turns
+five red, removing `sof-firmware`'s hardware gate turns four red, declaring one of the two rejected
+packages turns three red, pushing `pipewire-zeroconf` back into the rejected list turns four red,
+and renaming a gate on either of the two sides that have to agree about it turns twenty-three red.
+Each one goes green again on restore.
 
 ## License
 

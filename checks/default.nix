@@ -1,9 +1,16 @@
 # Pure evaluation checks. Everything nixaudio produces is a pure function of declared data, so the
 # whole contract is verifiable without a VM or a host. Both directions are proven throughout: the
 # right output is generated, AND the inputs that must be rejected are.
-{ pkgs, nixpkgs, nixaudioModule }:
+{ pkgs, nixpkgs, nixaudioModule, archModule }:
 let
   lib = nixpkgs.lib;
+
+  # The backend table and its resolution, imported directly. The table is what the module actually
+  # uses, so a check reading it here cannot drift from what a host gets; the resolution functions
+  # are exercised against FIXTURES below, for the branches no live entry has (`arch = null`,
+  # `aur = true`) -- see ../lib/resolve.nix's own header.
+  backendTable = import ../lib/packages.nix { };
+  resolve = import ../lib/resolve.nix { inherit lib; };
 
   # nixusb's option surface, inlined as a stub. nixaudio reads `config.nixusb.devices or { }`
   # defensively, so the checks must be able to exercise BOTH the composed case (this stub present)
@@ -35,19 +42,31 @@ let
   # The daemon and monitor modules take `pkgs`, so it has to be threaded through as a specialArg --
   # these are the same real pkgs the flake check runs with, so the packaged daemon and health probe
   # are evaluated for real rather than against a stub that could hide a broken derivation.
-  eval = modules: lib.evalModules {
+  #
+  # The stub set is shared by BOTH plane roots (the NixOS module and the system-manager one) so that
+  # the two are evaluated against identical surroundings and any difference between them is the
+  # planes' own, not the fixtures'.
+  evalPlane = root: modules: lib.evalModules {
     specialArgs = { inherit pkgs; };
     modules = [
-      nixaudioModule
+      root
       { options.assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
       { options.warnings = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; }; }
       { options.services.pipewire = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.environment.etc = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
+      { options.hardware.firmware = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
       { options.systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.security.pam.loginLimits = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
     ] ++ modules;
   };
+
+  eval = evalPlane nixaudioModule;
+
+  # The Arch/system-manager plane, evaluated for real rather than assumed to mirror the NixOS one.
+  # It is the plane where the backend is PACKAGES rather than options, so "the same selection
+  # resolves on both planes" is a claim that has to be checked, not asserted.
+  evalArch = evalPlane archModule;
 
   # nixiam.posix's group registry, stubbed. Only the shape nixaudio.rt reads is needed.
   nixiamStub = { lib, ... }: {
@@ -295,6 +314,90 @@ let
       nixaudio.devices.dock-mic.match."device.name" = "alsa_card.usb-dock";
     }
   ];
+
+  # ── Backend fixtures ────────────────────────────────────────────────────────────────────────
+  #
+  # `composed` above already carries `fabric.enable = true`, so it is also the plain NixOS-plane
+  # backend fixture (backend.enable follows fabric.enable) -- reused rather than duplicated, so the
+  # "a fabric host has a backend" wiring is exercised by the same fixture the fabric checks use.
+
+  # The same host, having stated that it has real Intel DSP audio hardware.
+  backendSof = eval [
+    nixusbStub
+    nixnetStub
+    inventory
+    {
+      nixnet.peers.host-a.hostnames = [ "host-a" ];
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.backend.sofFirmware.enable = true;
+    }
+  ];
+
+  # The backend WITHOUT the fabric: a host that wants its audio declared and joins no device pool.
+  # The supported direction of the two options' relationship (the other one is rejected, below).
+  backendOnly = eval [ { nixaudio.backend.enable = true; } ];
+
+  # Neither enabled: nothing at all should be published, so a host that has not opted in cannot
+  # find backend packages appearing in its own reconciler.
+  backendOff = eval [ { } ];
+
+  # The unsupported direction: a fabric with its backend switched off. Rendered config files for
+  # daemons nothing installed.
+  fabricWithoutBackend = eval [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.6";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.backend.enable = false;
+    }
+  ];
+
+  # The Arch/system-manager plane, where the backend is packages rather than options.
+  archPlane = evalArch [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.10";
+      nixaudio.fabric.peers.other.host = "host-c";
+    }
+  ];
+
+  archPlaneSof = evalArch [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.10";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.backend.sofFirmware.enable = true;
+    }
+  ];
+
+  # Fixtures for ../lib/resolve.nix's branches that no live table entry exercises. Written as the
+  # entries the module would hand it (table key already attached as `name`), so these test the real
+  # functions rather than a paraphrase of them.
+  resolveFixtures = [
+    { name = "repoapp"; arch = "repoapp"; nixpkgs = "repoapp"; nixosOption = null; }
+    { name = "aurapp"; arch = "aurapp"; aur = true; nixpkgs = null; nixosOption = null; }
+    { name = "nowhere-on-arch"; arch = null; nixpkgs = "nowhere"; nixosOption = null; }
+    { name = "option-provided"; arch = "optpkg"; nixpkgs = null; nixosOption = "services.example.enable"; }
+    { name = "blob"; arch = "blob"; nixpkgs = "blob"; nixosOption = null; firmware = true; gate = "someGate"; }
+  ];
+
+  # An entry naming BOTH channels -- the shadow the whole layer is built to make impossible. Kept
+  # out of the list above so every other resolve check runs against a well-formed table.
+  shadowFixture = [
+    { name = "double"; arch = "double"; nixpkgs = "double"; nixosOption = "services.example.enable"; }
+  ];
+
+  backendEntries = lib.mapAttrsToList (n: v: v // { name = n; }) backendTable.packages;
+  rejectedNames = lib.attrNames backendTable.rejected;
+
+  # Every list a host could install FROM, on either plane, for one fixture. What a rejected name
+  # must never appear in.
+  allOutputs = c:
+    let b = c.config.nixaudio.backend;
+    in b.archPackages ++ b.aurPackages ++ b.packageNames ++ b.firmwareNames;
+
+  pkgNames = list: map (p: p.pname or p.name or "?") list;
 
   names = c: map (d: d.name) c.config.nixaudio.resolvedDevices;
   rules = c: c.config.nixaudio.namingConfig;
@@ -612,6 +715,240 @@ let
       ok = builtins.any
         (e: lib.hasInfix "NIXAUDIO_FABRIC_CONFIG=/home/test/.config/nixaudio/fabric.json" e)
         homePlane.config.systemd.user.services.fabric-sync.Service.Environment;
+    }
+
+    # ── The backend: the universal set ────────────────────────────────────────────────────────
+    {
+      name = "the whole universal backend reaches archPackages -- exactly it, nothing else";
+      # Named literally rather than derived from the table: a check that recomputes what it is
+      # checking passes no matter what the table says, including when the table is wrong.
+      ok = lib.sort (a: b: a < b) archPlane.config.nixaudio.backend.archPackages == [
+        "alsa-utils"
+        "pipewire"
+        "pipewire-alsa"
+        "pipewire-audio"
+        "pipewire-pulse"
+        "pipewire-zeroconf"
+        "wireplumber"
+      ];
+    }
+    {
+      name = "pipewire-pulse is part of the declared backend, not an assumption the fabric makes";
+      # The fabric's own listener is loaded into it (modules/fabric.nix), so a host that got
+      # everything here EXCEPT this one would render a listener config for a daemon it never got.
+      ok = lib.elem "pipewire-pulse" archPlane.config.nixaudio.backend.archPackages;
+    }
+    {
+      name = "wireplumber is part of it too -- without it there are no device nodes to name";
+      ok = lib.elem "wireplumber" archPlane.config.nixaudio.backend.archPackages;
+    }
+    {
+      name = "alsa-utils is backend, not a desktop extra: it is what finds a hardware mute";
+      ok = lib.elem "alsa-utils" archPlane.config.nixaudio.backend.archPackages;
+    }
+    {
+      name = "no backend entry is AUR-only, and the AUR list is published anyway";
+      ok = archPlane.config.nixaudio.backend.aurPackages == [ ];
+    }
+    {
+      name = "every backend entry has a real Arch package, so nothing falls through to nixpkgs there";
+      ok = archPlane.config.nixaudio.backend.unavailableOnArch == [ ];
+    }
+    {
+      name = "the Arch plane installs NOTHING from nixpkgs -- it publishes names and stops";
+      # A nixpkgs copy of a daemon whose distro copy is already running and first on PATH is not
+      # redundancy, it is a second, competing install.
+      ok = archPlane.config.environment.systemPackages == [ ];
+    }
+
+    # ── The backend: the hardware gate ────────────────────────────────────────────────────────
+    {
+      name = "sof-firmware is ABSENT by default -- a container or a VM must not carry a DSP image";
+      ok = !(lib.elem "sof-firmware" archPlane.config.nixaudio.backend.archPackages)
+        && !(lib.elem "sof-firmware" composed.config.nixaudio.backend.packageNames)
+        && composed.config.nixaudio.backend.firmwareNames == [ ];
+    }
+    {
+      name = "sof-firmware appears once the host declares the hardware, on BOTH planes";
+      ok = lib.elem "sof-firmware" archPlaneSof.config.nixaudio.backend.archPackages
+        && backendSof.config.nixaudio.backend.firmwareNames == [ "sof-firmware" ];
+    }
+    {
+      name = "the gate moves ONLY that entry -- the rest of the selection is byte-identical";
+      ok =
+        let
+          off = lib.sort (a: b: a < b) archPlane.config.nixaudio.backend.archPackages;
+          on = lib.sort (a: b: a < b) archPlaneSof.config.nixaudio.backend.archPackages;
+        in lib.subtractLists off on == [ "sof-firmware" ] && lib.subtractLists on off == [ ];
+    }
+    {
+      name = "firmware is delivered as firmware, never as a package on PATH";
+      # `hardware.firmware` is the kernel's search path; environment.systemPackages is not, and a
+      # DSP image on $PATH is one the kernel will never find.
+      ok =
+        let c = backendSof.config;
+        in pkgNames c.hardware.firmware == [ "sof-firmware" ]
+          && !(lib.elem "sof-firmware" (pkgNames c.environment.systemPackages));
+    }
+    {
+      name = "every gate the table names is answered by the module, and every answer is used";
+      # The two halves of a gate live in different files -- the entry that names it, and the option
+      # that answers it -- so a rename on either side would drop that entry silently and completely.
+      # Checked in both directions: an unanswered gate, and an option nothing is gated on.
+      ok =
+        let
+          declared = lib.unique (lib.filter (g: g != null) (map (e: e.gate or null) backendEntries));
+          answered = lib.attrNames archPlane.config.nixaudio.backend.hardwareGates;
+        in lib.sort (a: b: a < b) declared == lib.sort (a: b: a < b) answered
+          && declared != [ ];
+    }
+
+    # ── The plane divide: what NixOS's own options provide, and must not be installed twice ────
+    {
+      name = "on NixOS this module installs EXACTLY the one entry no services.pipewire option provides";
+      ok = composed.config.nixaudio.backend.packageNames == [ "alsa-utils" ];
+    }
+    {
+      name = "the six option-provided entries are published as such, each naming its own option";
+      ok = composed.config.nixaudio.backend.providedByNixosOptions == {
+        pipewire = "services.pipewire.enable";
+        wireplumber = "services.pipewire.wireplumber.enable";
+        "pipewire-pulse" = "services.pipewire.pulse.enable";
+        "pipewire-alsa" = "services.pipewire.alsa.enable";
+        "pipewire-audio" = "services.pipewire.enable";
+        "pipewire-zeroconf" = "services.pipewire.enable";
+      };
+    }
+    {
+      name = "THE ANTI-SHADOWING INVARIANT: nothing an option provides is also installed as a package";
+      ok =
+        let
+          b = composed.config.nixaudio.backend;
+          provided = lib.attrNames b.providedByNixosOptions;
+        in lib.intersectLists provided (b.packageNames ++ b.firmwareNames) == [ ]
+          # ...and the same again at the entry level, where the table could break it
+          && resolve.shadowed backendEntries == [ ];
+    }
+    {
+      name = "an entry naming BOTH a nixpkgs attribute and a NixOS option is caught, not merged";
+      # Non-vacuity for the check above: the invariant holds for the real table, and the mechanism
+      # that would report a violation actually reports one.
+      ok = resolve.shadowed shadowFixture == [ "double" ];
+    }
+    {
+      name = "the installed NixOS package set carries alsa-utils and NO second PipeWire";
+      ok =
+        let installed = pkgNames composed.config.environment.systemPackages;
+        in lib.elem "alsa-utils" installed
+          && !(lib.elem "pipewire" installed)
+          && !(lib.elem "wireplumber" installed);
+    }
+    {
+      name = "the NixOS plane switches on the options that ARE the packages there";
+      ok =
+        let p = composed.config.services.pipewire;
+        in p.enable == true && p.pulse.enable == true && p.wireplumber.enable == true;
+    }
+    {
+      name = "BOTH PLANES SELECT THE SAME BACKEND -- only the delivery differs";
+      # The one claim the plane divide rests on. Compared by table key rather than by package name,
+      # so it stays a real comparison the day an Arch name and a nixpkgs attribute diverge.
+      ok = lib.sort (a: b: a < b) composed.config.nixaudio.backend.selection
+        == lib.sort (a: b: a < b) archPlane.config.nixaudio.backend.selection;
+    }
+    {
+      name = "...and they still agree once a hardware gate is on";
+      ok = lib.sort (a: b: a < b) backendSof.config.nixaudio.backend.selection
+        == lib.sort (a: b: a < b) archPlaneSof.config.nixaudio.backend.selection
+        && lib.elem "sof-firmware" backendSof.config.nixaudio.backend.selection;
+    }
+
+    # ── The three that are installed in the wild and must never be declared ────────────────────
+    {
+      name = "the rejected list still names the two that were ruled out, with reasons";
+      # Guards the check below from passing because the list quietly became empty.
+      ok = lib.sort (a: b: a < b) rejectedNames == [ "alsa-firmware" "alsa-plugins" ]
+        && builtins.all (n: builtins.isString backendTable.rejected.${n}) rejectedNames;
+    }
+    {
+      name = "no rejected name reaches ANY output list, on either plane, gated or not";
+      ok = builtins.all
+        (n: !(lib.elem n (allOutputs archPlane ++ allOutputs archPlaneSof ++ allOutputs composed ++ allOutputs backendSof)))
+        rejectedNames;
+    }
+    {
+      name = "zeroconf IS declared -- rejected as a fabric transport is not the same as unwanted";
+      # The distinction the entry itself is about: this module refuses to route the device pool
+      # over zeroconf, and still installs the package for the RAOP/AirPlay discovery it also
+      # carries. Asserted so a future reader cannot "tidy it away" back into the rejected list on
+      # the strength of fabric.nix's header alone.
+      ok = lib.elem "pipewire-zeroconf" archPlane.config.nixaudio.backend.archPackages
+        && !(lib.elem "pipewire-zeroconf" rejectedNames)
+        # ...and it is NOT installed as a package on NixOS, where the pipewire derivation already
+        # carries libpipewire-module-{zeroconf-discover,raop-discover,raop-sink}.so.
+        && composed.config.nixaudio.backend.providedByNixosOptions."pipewire-zeroconf"
+        == "services.pipewire.enable";
+    }
+
+    # ── enable/disable, both directions ───────────────────────────────────────────────────────
+    {
+      name = "the backend follows fabric.enable, because the fabric is written against it";
+      ok = composed.config.nixaudio.backend.enable;
+    }
+    {
+      name = "a fabric with its backend switched off is REJECTED";
+      ok = builtins.length (failed fabricWithoutBackend) == 1;
+    }
+    {
+      name = "the backend WITHOUT a fabric is supported: declared audio, no device pool";
+      ok = failed backendOnly == [ ]
+        && lib.elem "pipewire" backendOnly.config.nixaudio.backend.archPackages
+        && backendOnly.config.nixaudio.backend.packageNames == [ "alsa-utils" ];
+    }
+    {
+      name = "a host that enabled neither gets NOTHING published -- not a list it never asked for";
+      ok =
+        let b = backendOff.config.nixaudio.backend;
+        in b.archPackages == [ ] && b.aurPackages == [ ] && b.packageNames == [ ]
+          && b.firmwareNames == [ ] && b.providedByNixosOptions == { }
+          && backendOff.config.environment.systemPackages == [ ];
+    }
+
+    # ── Resolution branches no live entry exercises ───────────────────────────────────────────
+    {
+      name = "an AUR entry is held back from archPackages and lands in aurPackages";
+      # pacman -S fails the WHOLE transaction on an AUR name, so this separation is not cosmetic.
+      ok = !(lib.elem "aurapp" (resolve.archPackages resolveFixtures))
+        && resolve.aurPackages resolveFixtures == [ "aurapp" ];
+    }
+    {
+      name = "an entry with no Arch package at all is reported by NAME, never as a null";
+      ok = resolve.unavailableOnArch resolveFixtures == [ "nowhere-on-arch" ]
+        && !(builtins.elem null (resolve.archPackages resolveFixtures))
+        && !(builtins.elem null (resolve.aurPackages resolveFixtures));
+    }
+    {
+      name = "an option-provided entry contributes to neither nixpkgs list";
+      ok = !(lib.elem "optpkg" (resolve.packageNames resolveFixtures))
+        && resolve.providedByNixosOptions resolveFixtures == {
+        option-provided = "services.example.enable";
+      };
+    }
+    {
+      name = "firmware is separated from packageNames by the resolution itself, not by the caller";
+      ok = resolve.firmwareNames resolveFixtures == [ "blob" ]
+        && !(lib.elem "blob" (resolve.packageNames resolveFixtures));
+    }
+    {
+      name = "a gated entry is dropped when its gate is off and kept when it is on";
+      ok = resolve.selected { someGate = false; } resolveFixtures
+        == lib.filter (e: e.name != "blob") resolveFixtures
+        && resolve.selected { someGate = true; } resolveFixtures == resolveFixtures;
+    }
+    {
+      name = "an empty selection resolves to empty lists, not to an error";
+      ok = resolve.archPackages [ ] == [ ] && resolve.aurPackages [ ] == [ ]
+        && resolve.packageNames [ ] == [ ] && resolve.unavailableOnArch [ ] == [ ];
     }
   ];
 

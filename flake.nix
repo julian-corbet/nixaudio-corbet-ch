@@ -33,11 +33,18 @@
       homeManagerModules.nixaudio = import ./home/fabric-sync.nix;
       homeManagerModules.default = self.homeManagerModules.nixaudio;
 
+      # The backend table and its resolution, exposed so a consumer can inspect or validate them
+      # without re-reading the files -- e.g. to see which packages a host will be told to install
+      # before wiring anything.
+      lib.packages = import ./lib/packages.nix { };
+      lib.resolve = import ./lib/resolve.nix { inherit lib; };
+
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;
           inherit nixpkgs;
           nixaudioModule = self.nixosModules.nixaudio;
+          archModule = self.systemManagerModules.nixaudio;
         }
       );
 
