@@ -391,6 +391,37 @@ let
   backendEntries = lib.mapAttrsToList (n: v: v // { name = n; }) backendTable.packages;
   rejectedNames = lib.attrNames backendTable.rejected;
 
+  # ── Control fixtures ────────────────────────────────────────────────────────────────────────
+  #
+  # The control layer's whole claim is that it is INDEPENDENT of the backend in both directions: a
+  # host may declare the sound server and want no tools, or want a tool on a machine whose PipeWire
+  # is somebody else's. Both directions get a fixture, because a single all-on one would pass just
+  # as happily if the two had been folded into one gate.
+  controlsTable = import ../lib/controls.nix { };
+  controlsEntries = lib.mapAttrsToList (n: v: v // { name = n; }) controlsTable.controls;
+
+  # A full backend host that asked for no controls at all.
+  controlsOff = backendOnly;
+
+  # Controls with no backend: the shape that would silently vanish if the NixOS delivery were
+  # folded into modules/backend-nixos.nix's `mkIf cfg.enable`.
+  controlsWithoutBackend = eval [
+    {
+      nixaudio.controls.pavucontrol.enable = true;
+      nixaudio.controls.playerctl.enable = true;
+    }
+  ];
+
+  # One control only, to prove the gates are genuinely per-tool rather than a shared switch.
+  playerctlOnly = eval [ { nixaudio.controls.playerctl.enable = true; } ];
+
+  archControls = evalArch [
+    {
+      nixaudio.controls.pavucontrol.enable = true;
+      nixaudio.controls.playerctl.enable = true;
+    }
+  ];
+
   # Every list a host could install FROM, on either plane, for one fixture. What a rejected name
   # must never appear in.
   allOutputs = c:
@@ -949,6 +980,55 @@ let
       name = "an empty selection resolves to empty lists, not to an error";
       ok = resolve.archPackages [ ] == [ ] && resolve.aurPackages [ ] == [ ]
         && resolve.packageNames [ ] == [ ] && resolve.unavailableOnArch [ ] == [ ];
+    }
+
+    # ── The control layer ──────────────────────────────────────────────────────────────────────
+    {
+      name = "every control is gated: a host that names none gets none, backend or not";
+      ok = controlsOff.config.nixaudio.controls.selection == [ ]
+        && controlsOff.config.nixaudio.controls.archPackages == [ ]
+        && controlsOff.config.nixaudio.controls.packageNames == [ ];
+    }
+    {
+      name = "no control entry is universal -- an ungated one would appear on every host";
+      ok = lib.all (e: (e.gate or null) != null) controlsEntries;
+    }
+    {
+      # The gate names in lib/controls.nix and the options answering them live in different files;
+      # a mismatch drops an entry silently, which is the failure the module's own assertion exists
+      # for. Proven non-vacuous here by asserting no such assertion is currently failing.
+      name = "every gate named by the control table is answered by the module";
+      ok = failed archControls == [ ] && failed controlsWithoutBackend == [ ];
+    }
+    {
+      name = "controls do not require the backend -- the delivery is not folded into its mkIf";
+      ok = lib.sort (a: b: a < b) controlsWithoutBackend.config.nixaudio.controls.selection
+        == [ "pavucontrol" "playerctl" ]
+        && lib.all (n: lib.elem n (pkgNames controlsWithoutBackend.config.environment.systemPackages))
+        [ "pavucontrol" "playerctl" ];
+    }
+    {
+      name = "each control is its own decision, not one shared switch";
+      ok = playerctlOnly.config.nixaudio.controls.selection == [ "playerctl" ]
+        && playerctlOnly.config.nixaudio.controls.packageNames == [ "playerctl" ];
+    }
+    {
+      name = "the Arch plane publishes control names and installs nothing";
+      ok = lib.sort (a: b: a < b) archControls.config.nixaudio.controls.archPackages
+        == [ "pavucontrol" "playerctl" ]
+        && archControls.config.nixaudio.controls.aurPackages == [ ]
+        && archControls.config.nixaudio.controls.unavailableOnArch == [ ];
+    }
+    {
+      # The two tables must stay disjoint: a name in both would be installed twice on NixOS and
+      # declared twice into a reconciler on Arch, and the second copy is the one that keeps working
+      # after the first is removed.
+      name = "no name appears in both the backend table and the control table";
+      ok = lib.intersectLists (lib.attrNames backendTable.packages) (lib.attrNames controlsTable.controls) == [ ];
+    }
+    {
+      name = "no control is silently rejected by the backend table's own reject list";
+      ok = lib.intersectLists rejectedNames (lib.attrNames controlsTable.controls) == [ ];
     }
   ];
 

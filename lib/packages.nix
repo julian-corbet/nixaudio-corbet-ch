@@ -82,9 +82,14 @@
 # carries RAOP/AirPlay discovery for third-party network sinks, which is a capability of its own.
 # It is in the universal set below, with that distinction stated on the entry.
 #
-# Frontend/GUI tooling is out of scope by construction: a patchbay, a mixer applet or a tray is
-# something a PERSON runs, which makes it a desktop selection, not the sound server. This table is
-# the daemon layer a host has to have before any of that has anything to talk to.
+# Tooling a PERSON drives -- a mixer, a media-transport controller -- is not in this table. It is in
+# ./controls.nix, a second table with the identical entry shape read by the identical resolver, and
+# the split is behavioural rather than tidy: this layer is a precondition, so ../system-manager/
+# default.nix fails the build on an entry with no pacman name, and that rule is correct for a daemon
+# and wrong for a standalone GUI. A patchbay is in NEITHER, and stays a desktop selection: it edits
+# the graph's topology as a window full of nodes rather than addressing this module's own subjects.
+# What this table is, is the daemon layer a host has to have before any of that has anything to talk
+# to.
 { ... }:
 {
   # ── The backend proper ──────────────────────────────────────────────────────────────────────
