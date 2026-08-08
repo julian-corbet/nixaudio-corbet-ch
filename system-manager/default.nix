@@ -39,15 +39,6 @@ in
     ../modules/catalogue.nix
     ../modules/daemon.nix
     ../modules/backend.nix
-    # The control layer, published exactly like the backend and installed exactly as little:
-    #
-    #   nixarch.packages.pacman = config.nixaudio.controls.archPackages;
-    #
-    # No assertion accompanies it, unlike the backend's `unavailableOnArch` check below, and that
-    # asymmetry is deliberate -- see ../modules/controls.nix's own option doc. A daemon with no
-    # pacman name would leave this plane writing config for something nothing installed; a mixer
-    # with no pacman name is simply a tool this platform does not carry.
-    ../modules/controls.nix
   ];
 
   config = lib.mkMerge [
