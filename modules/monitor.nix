@@ -60,26 +60,43 @@ let
       # because the alerting wrapper only fires on a transition. It was blind for the entire window
       # in which the fabric actually broke.
       #
-      # So: find the session's runtime directory rather than assuming we are in it. One
-      # pulse socket means one session and no ambiguity; several means the host must say which.
-      if [ -z "''${PULSE_RUNTIME_PATH:-}" ] && [ ! -S "''${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native" ]; then
+      # So: find the session's socket and ADDRESS IT DIRECTLY. One socket means one session and no
+      # ambiguity; several means the host must say which.
+      #
+      # ── NEVER `export PULSE_RUNTIME_PATH` HERE. IT IS DESTRUCTIVE WHEN RUN AS ROOT. ───────────
+      #
+      # libpulse does not merely READ the directory that variable names -- it "secures" it, which
+      # means chowning it to the CALLING uid and setting 0700. Point root's libpulse at a user's
+      # runtime directory and it takes ownership of it, after which that user can no longer traverse
+      # into its own `pulse/native` socket at all.
+      #
+      # Reproduced, by this very probe, on a live host: an as-root run at 05:21:57 flipped
+      # /run/user/1000/pulse to root:root 0700, and 32 seconds later the fabric daemon began logging
+      # `local pulse unresponsive` and restarting the audio stack every five minutes -- because its
+      # own `pactl` could no longer reach the socket. A health check that breaks the thing it
+      # measures is worse than no health check, and this one did it while trying to fix being unable
+      # to see.
+      #
+      # `pactl -s unix:<socket>` takes an explicit server address instead. It opens the socket and
+      # nothing else: no runtime directory is consulted, created, chowned or locked.
+      server="''${NIXAUDIO_PULSE_SERVER:-}"
+      if [ -z "$server" ]; then
         mapfile -t sockets < <(find /run/user -mindepth 3 -maxdepth 3 -path '*/pulse/native' 2>/dev/null)
         if [ "''${#sockets[@]}" -eq 1 ]; then
-          PULSE_RUNTIME_PATH="$(dirname "''${sockets[0]}")"
-          export PULSE_RUNTIME_PATH
+          server="unix:''${sockets[0]}"
         elif [ "''${#sockets[@]}" -eq 0 ]; then
           echo "fabric: no PipeWire session found (looked for /run/user/*/pulse/native)" >&2
           exit 1
         else
-          echo "fabric: ''${#sockets[@]} PipeWire sessions on this host; set PULSE_RUNTIME_PATH to pick one" >&2
+          echo "fabric: ''${#sockets[@]} PipeWire sessions here; set NIXAUDIO_PULSE_SERVER to pick one" >&2
           exit 1
         fi
       fi
 
       # Fail loudly rather than silently scoring every peer as unmirrored, which is the exact shape
       # of the nine-day false negative above.
-      if ! pactl info >/dev/null 2>&1; then
-        echo "fabric: cannot reach the local PipeWire graph (PULSE_RUNTIME_PATH=''${PULSE_RUNTIME_PATH:-unset})" >&2
+      if ! pactl -s "$server" info >/dev/null 2>&1; then
+        echo "fabric: cannot reach the local PipeWire graph at $server" >&2
         exit 1
       fi
 
@@ -114,7 +131,7 @@ let
           | grep -cve 'fabric_' -e 'fabricsrc_' -e 'tunnel\.' || true)
 
         if [ "$real" -gt 0 ]; then
-          held=$(pactl list modules short 2>/dev/null | grep -c "server=tcp:$peer_host:$port" || true)
+          held=$(pactl -s "$server" list modules short 2>/dev/null | grep -c "server=tcp:$peer_host:$port" || true)
           if [ "$held" -eq 0 ]; then
             echo "fabric: peer $peer_host offers $real real device(s) but this host holds no tunnel to it"
             unhealthy=$((unhealthy + 1))
