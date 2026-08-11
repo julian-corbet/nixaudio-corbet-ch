@@ -45,11 +45,19 @@
 # into the same host, both carry PipeWire's own ALSA-monitor-assigned `priority.session = 1109` for
 # their sinks — verified live with `pw-dump`, an exact tie. WirePlumber's default-node picker breaks
 # a tie by whichever enumerated last, which is exactly the `hw:N`/enumeration-order instability this
-# module's whole naming scheme already exists to route around (see above). The other reported cause,
-# a stale WirePlumber state file remembering an old default by NAME, is a second way the same
-# symptom shows up — and it is exactly why `nixaudio.priorities` (below) matches on vendor/product
-# id through the identical mechanism `nixaudio.devices`/`fromUsb` already use, never on a node name
-# or description a stale state file could have cached.
+# module's whole naming scheme already exists to route around (see above).
+#
+# `nixaudio.priorities` is therefore bound to hardware identity, never to a node name or description
+# that a stale WirePlumber state file could have cached — but it cannot be bound to it DIRECTLY,
+# because no node object carries a hardware id. It is bound through a carrier property minted by the
+# device rule; `carrierKey` below is where that mechanism is described, and it is worth reading
+# before editing either rule, because the shape that looks obvious does not work and does not
+# complain.
+#
+# A stale state file is a SECOND way the same symptom shows up, and priorities do not beat it: a
+# default a human once chose is remembered per node and outranks any number declared here. That is
+# deliberate (it is the same "the live choice wins" rule stated below), and `restoreDefaultTargets`
+# is the switch for a host that wants declared priority to be authoritative instead.
 #
 # `nixaudio.priorities.<name>` lets a device explicitly outrank a rival instead of gambling on
 # enumeration order. It is deliberately NOT part of `nixaudio.devices` or projected from
@@ -142,6 +150,51 @@ let
 
   allDevices = derivedDevices ++ explicitDevices;
 
+  # A priority is a NUMBER plus an optional profile to aim it at, but the overwhelmingly common case
+  # is a device with exactly one sink and one source, where a bare integer says everything. So the
+  # bare integer stays the surface and is coerced up, rather than making every host write
+  # `sink.priority = 1200` to buy a narrowing axis it does not need.
+  #
+  # The narrowing axis is not optional in general: one ALSA card commonly spawns several sinks (an
+  # internal codec with speakers plus every HDMI/DP output), and a rule that names only the device
+  # and the media class stamps ONE number onto ALL of them. Measured on a real internal card, that
+  # collapses a working 1000/696/680/664 ranking into a four-way tie and makes an unplugged HDMI
+  # port as eligible to be the default output as the speakers.
+  priorityType = lib.types.nullOr (lib.types.coercedTo
+    lib.types.ints.positive
+    (priority: { inherit priority; profile = null; })
+    (lib.types.submodule {
+      options = {
+        priority = lib.mkOption {
+          type = lib.types.ints.positive;
+          example = 2000;
+          description = "The `priority.session` value to stamp onto the matching node(s).";
+        };
+
+        profile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "HiFi: Speaker: sink";
+          description = ''
+            Narrow this priority to ONE node of a card that spawns several, by
+            `device.profile.name`. Null (the default) applies it to every node of the declared media
+            class, which is correct for a device with a single output or input and wrong for an
+            internal codec.
+
+            The value is WirePlumber's own profile-device name, as reported by
+            `pw-dump` on the node you mean — read it off the running graph rather than guessing at
+            its punctuation.
+
+            NOT `card.profile.device`, which looks like it would do the same job and does not: it is
+            a per-card ORDINAL whose meaning differs between cards. Measured on one host, index 0 is
+            an HDMI output on the internal card and index 3 is the speakers, while on both USB
+            devices index 3 is the sink — so a number that selects the right node on one card
+            selects an arbitrary one on the next.
+          '';
+        };
+      };
+    }));
+
   # No override declared for this device: `null` on both axes means "leave WirePlumber's own
   # ALSA-monitor heuristic alone", i.e. render no priority.session rule at all for it (see
   # priorityRulesFor). This is the default every device gets unless named in `cfg.priorities`.
@@ -162,49 +215,103 @@ let
   unknownPriorityNames =
     lib.subtractLists (map (d: d.name) allDevices) (lib.attrNames cfg.priorities);
 
-  # WirePlumber 0.5 rule syntax (SPA-JSON). One rule per device: match on the stable identity, then
-  # stamp the name we chose onto device.description and node.nick so it shows up that way everywhere,
-  # including in the tunnel descriptions peers see when this device is mirrored.
-  mkRule = device: ''
+  # ── THE CARRIER, AND WHY THE OBVIOUS SHAPE DOES NOT WORK ──────────────────────────────────────
+  #
+  # A DEVICE and the NODES it spawns are two different objects with two different property sets, and
+  # `monitor.alsa.rules` is evaluated separately against each. That fact killed the previous version
+  # of this generator, silently, on every host that ever ran it:
+  #
+  #   * The identity keys -- device.vendor.id, device.product.id, device.bus-id -- are written by
+  #     PipeWire's udev layer onto the DEVICE only (spa/plugins/alsa/alsa-udev.c). No node has any
+  #     of them.
+  #   * `media.class` is "Audio/Sink" or "Audio/Source" on the NODES. The device object carries
+  #     "Audio/Device" and never matches either.
+  #
+  # So a matcher listing BOTH -- identity AND media.class, which is what this file used to render --
+  # describes an object that does not exist. It matched the device (no media.class) never, and the
+  # nodes (no identity keys) never. Every `nixaudio.priorities` declaration ever written was a
+  # no-op, and nothing said so: a rule that matches nothing is not an error in WirePlumber, it is
+  # just a rule that matches nothing. Reproduced live against the shipped text, with a
+  # `media.class`-only control rule in the same file and the same restart proving the file was read.
+  #
+  # WHAT ACTUALLY BRIDGES THE TWO. WirePlumber's ALSA monitor copies device properties onto each
+  # node it creates, but by a PREFIX FILTER rather than a fixed key list -- every key beginning
+  # `alsa.` or `api.alsa.card.` (scripts/monitors/alsa.lua, "add api.alsa.card.* and alsa.*
+  # properties for rule matching purposes"), and it does so BEFORE the node rule pass. Upstream put
+  # that loop there for exactly this purpose.
+  #
+  # So the identity match stays where it already works -- on the device, unchanged, still pinned to
+  # vendor/product/bus-id and never to a name -- and additionally mints one synthetic label under
+  # `alsa.`. That label rides the copy onto every node of that card, where a second rule matches it
+  # together with media.class. The hardware matcher is not weakened; a label derived from it is
+  # simply carried somewhere the first matcher cannot reach.
+  #
+  # Verified end to end on real hardware (USB headset, USB interface, internal Intel DSP card):
+  # a carrier under `alsa.` reaches the nodes, an otherwise identical carrier under a non-`alsa.`
+  # namespace does not, and priority.session then lands on exactly the sink or source asked for.
+  carrierKey = "alsa.nixaudio.device";
+
+  renderMatch = match: lib.concatStringsSep "\n" (lib.mapAttrsToList
+    (key: value: "        ${key} = \"${value}\"")
+    match);
+
+  mkMatchRule = match: actions: ''
     {
       matches = [
         {
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList
-      (key: value: "        ${key} = \"${value}\"")
-      device.match)}
+    ${renderMatch match}
         }
       ]
       actions = {
         update-props = {
-          device.description = "${device.description}"
-          device.nick = "${device.name}"
-          node.nick = "${device.name}"
+    ${lib.concatStringsSep "\n" (map (line: "      ${line}") actions)}
         }
       }
     }'';
 
-  # Same identity matcher as mkRule, narrowed to just the sink or just the source node a device
-  # spawns via `media.class` -- the PipeWire-assigned node property that tells the two apart
-  # ("Audio/Sink" / "Audio/Source"). The ALSA *device* object itself carries "Audio/Device" and so
-  # never matches either, which is what keeps this rule from also stamping priority.session onto the
-  # device object mkRule above updates -- device objects have no priority.session to begin with, only
-  # the sink/source nodes spawned under them do.
-  mkPriorityRule = device: mediaClass: value: ''
+  # The DEVICE rule: stable hardware identity in, the chosen name out. `device.description` and
+  # `device.nick` are the device object's own; the carrier is what makes the node rules below
+  # possible at all.
+  mkRule = device: mkMatchRule device.match [
+    ''device.description = "${device.description}"''
+    ''device.nick = "${device.name}"''
+    ''${carrierKey} = "${device.name}"''
+  ];
+
+  # The NICK rule, and it is a REAL fix rather than a reshuffle. `node.nick` used to be set in the
+  # device rule above, where it is inert: it lands on the device object, and `node.nick` is matched
+  # by neither half of the copy filter, so it never reached a single node. Node naming appeared to
+  # work only through an accident of upstream's fallback chain -- alsa.lua substitutes
+  # `device.nick` when a node's own `alsa.name` is the literal string "USB Audio", which every USB
+  # audio-class card reports and no PCI card does. Measured on an internal Intel DSP card whose
+  # device.nick was set correctly: its six nodes were named Speaker / HDMI 1 / HDMI 2 / HDMI 3 /
+  # Stereo Microphone / Digital Microphone, i.e. the declared name reached none of them.
+  #
+  # Setting it from a node rule makes the declared name actually authoritative on every card type.
+  mkNickRule = device: mkMatchRule
     {
-      matches = [
-        {
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList
-      (key: value: "        ${key} = \"${value}\"")
-      device.match)}
-          media.class = "${mediaClass}"
-        }
-      ]
-      actions = {
-        update-props = {
-          priority.session = ${toString value}
-        }
-      }
-    }'';
+      ${carrierKey} = device.name;
+      "media.class" = "~^Audio/(Sink|Source)$";
+    } [ ''node.nick = "${device.name}"'' ];
+
+  # The PRIORITY rule: carrier + media.class, both node properties, so it describes an object that
+  # exists. No identity keys here -- the device rule already did that work, and repeating it is what
+  # made this unsatisfiable before.
+  #
+  # `profile` narrows further, and is not optional decoration on a multi-PCM card. One card can
+  # spawn many sinks (an internal codec typically exposes speakers plus every HDMI/DP output), and
+  # carrier + media.class alone stamps ONE number onto ALL of them -- measured: a single unnarrowed
+  # rule flattened four sinks whose distinct 1000/696/680/664 ranking is the thing that keeps an
+  # unplugged HDMI port from becoming the default output. `device.profile.name` is the key that
+  # separates them.
+  mkPriorityRule = device: mediaClass: value: mkMatchRule
+    ({
+      ${carrierKey} = device.name;
+      "media.class" = mediaClass;
+    } // lib.optionalAttrs (value.profile != null) {
+      "device.profile.name" = value.profile;
+    })
+    [ "priority.session = ${toString value.priority}" ];
 
   # Zero, one or two extra rules per device -- sink and source are independent, so either, both or
   # neither may be declared (see this file's header for why one number cannot express both).
@@ -215,15 +322,33 @@ let
   namingConfig = ''
     # Generated by nixaudio.devices -- do not edit.
     #
-    # Matches on vendor/product id (and bus-id where a serial disambiguates two units of one model),
-    # never on api.alsa.path or device.bus-path, both of which change when the device moves ports or
-    # the enumeration order shifts. Priority overrides (nixaudio.priorities) reuse this identical
-    # matcher, narrowed to the sink or source node with media.class -- a node.name or
-    # device.description string is exactly what a stale WirePlumber state file gets wrong, so
-    # priority is pinned to hardware identity here too, never to a name.
+    # TWO PASSES, because a DEVICE and the NODES under it are different objects with different
+    # properties, and this file is evaluated separately against each:
+    #
+    #   1. The DEVICE rule matches stable hardware identity -- vendor/product id, plus a bus-id
+    #      substring where a serial disambiguates two units of one model. Never api.alsa.path or
+    #      device.bus-path, both of which change when the device moves ports or the enumeration
+    #      order shifts. It stamps the chosen name onto the device AND mints ${carrierKey}.
+    #
+    #   2. The NODE rules match that carrier plus media.class. They cannot match hardware identity
+    #      directly: no node carries device.vendor.id, device.product.id or device.bus-id at all.
+    #      The carrier reaches them because WirePlumber's ALSA monitor copies every device property
+    #      prefixed `alsa.` or `api.alsa.card.` onto each node before applying these rules.
+    #
+    # A single rule listing identity AND media.class -- which is what this file used to generate --
+    # describes no object that exists, and silently matched nothing on every host.
     monitor.alsa.rules = [
-    ${lib.concatStringsSep "\n" (lib.concatMap (device: [ (mkRule device) ] ++ priorityRulesFor device) resolvedDevices)}
+    ${lib.concatStringsSep "\n" (lib.concatMap
+      (device: [ (mkRule device) (mkNickRule device) ] ++ priorityRulesFor device)
+      resolvedDevices)}
     ]
+  ''
+  + lib.optionalString (!cfg.restoreDefaultTargets) ''
+
+    # nixaudio.devices.restoreDefaultTargets = false
+    wireplumber.settings = {
+      node.restore-default-targets = false
+    }
   '';
 
   duplicateNames =
@@ -292,11 +417,37 @@ in
       '';
     };
 
+    restoreDefaultTargets = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Let WirePlumber keep remembering, across sessions, which sink and source a human last chose
+        with `wpctl set-default` (its own `node.restore-default-targets`, whose upstream default
+        this mirrors).
+
+        READ THIS BEFORE CONCLUDING `nixaudio.priorities` DOES NOT WORK. A remembered choice
+        OUTRANKS any priority declared here, and the memory is per node, in
+        `~/.local/state/wireplumber/default-nodes`. Measured on a real host: a sink declared at 9000
+        still lost the default to a sink at 1200 that the state file had pinned, and setting this to
+        false moved the default to the 9000 sink in the same session. So on a machine that has been
+        used for a while, priorities arbitrate only among nodes the state file has never seen — and
+        that can be very few of them.
+
+        It stays TRUE by default anyway, because that is what this module already promises
+        everywhere else: `nixaudio.priorities` is documented as a tie-breaker for an unopinionated
+        app, and `modules/fabric.nix`'s "ROUTING INTENT IS STATE, NOT CONFIGURATION" says the live
+        choice wins. A human who moved their default output is the clearest possible expression of
+        exactly that. Turning this off makes declared priority authoritative instead, at the price
+        of a `wpctl set-default` no longer surviving a logout — which is a real preference about how
+        the machine should behave, not a defect, so it is a switch and not a default.
+      '';
+    };
+
     priorities = lib.mkOption {
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
           sink = lib.mkOption {
-            type = lib.types.nullOr lib.types.ints.positive;
+            type = priorityType;
             default = null;
             example = 2000;
             description = ''
@@ -304,10 +455,19 @@ in
               whatever WirePlumber's ALSA monitor would otherwise assign it. `null` (the default)
               leaves that heuristic alone.
 
+              A bare integer applies to EVERY sink node the device spawns, which is what you want
+              for a headset or an interface with one output. Give an attrset instead —
+              `{ priority = 1450; profile = "HiFi: Speaker: sink"; }` — to aim at ONE of several,
+              and read `profile`'s own description before declaring a bare integer for an internal
+              codec: a card with speakers and three HDMI outputs has four sinks, and one number for
+              all four is not a tie-break, it is the loss of a ranking that already worked.
+
               A tie-breaker for an unopinionated app's default-sink pick, never a route: see this
               file's header, and `modules/fabric.nix`'s "ROUTING INTENT IS STATE, NOT CONFIGURATION"
               — the moment any app or a human pins a sink explicitly, that live choice wins over
-              this regardless of the number here.
+              this regardless of the number here. Note that a human's pin is REMEMBERED across
+              sessions by WirePlumber's own state file, and a remembered pin outranks any number
+              declared here; `restoreDefaultTargets` is where that interaction is described.
 
               Must be a positive integer (`>= 1`); the type itself refuses 0 and below, because 0 is
               what `modules/fabric.nix`'s `mirrorPriorityConfig` stamps onto a deprioritised mirror,
@@ -316,13 +476,14 @@ in
           };
 
           source = lib.mkOption {
-            type = lib.types.nullOr lib.types.ints.positive;
+            type = priorityType;
             default = null;
             example = 2000;
             description = ''
               `priority.session` this device's SOURCE (capture) node should carry. Same tie-breaker
-              semantics and number space as `sink` above, but set independently — see this file's
-              header for why one device's best output and best input are not always the same unit.
+              semantics, number space and bare-integer/attrset shape as `sink` above, but set
+              independently — see this file's header for why one device's best output and best input
+              are not always the same unit.
             '';
           };
         };

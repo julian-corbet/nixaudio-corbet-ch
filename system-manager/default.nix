@@ -35,13 +35,31 @@ in
 {
   imports = [
     ../modules/devices.nix
+    ../modules/dropins.nix
     ../modules/fabric.nix
     ../modules/catalogue.nix
     ../modules/daemon.nix
+    ../modules/guard.nix
     ../modules/backend.nix
   ];
 
   config = lib.mkMerge [
+    # This plane writes /etc, which every session on the host reads, so it claims the fragments by
+    # default. A host that composes the home-manager plane as well must NOT let both write -- see
+    # ../modules/dropins.nix for the deterministic listener failure that produces.
+    { nixaudio.dropIns = lib.mkDefault "system"; }
+
+    # The reservation fragment is NOT gated on the fabric: it is backend-level, and a host with
+    # declared audio and no device pool loses its cards to the same D-Bus timeout. The guard UNIT is
+    # deliberately absent from this plane -- system-manager never reloads the user manager, so a
+    # `systemd --user` unit written here would stay inert until the next login. That half belongs to
+    # the home-manager plane (../home/fabric-sync.nix), which is why nixaudio's own docs call that
+    # plane non-optional on a system-manager host.
+    (lib.mkIf (cfg.dropIns == "system" && cfg.guard.wireplumberConfig != "") {
+      environment.etc."wireplumber/wireplumber.conf.d/50-nixaudio-reservation.conf".text =
+        cfg.guard.wireplumberConfig;
+    })
+
     (lib.mkIf cfg.backend.enable {
       assertions = [
         {
@@ -58,7 +76,7 @@ in
       ];
     })
 
-    (lib.mkIf cfg.fabric.enable {
+    (lib.mkIf (cfg.fabric.enable && cfg.dropIns == "system") {
       environment.etc = {
         # /etc/pipewire/*.conf.d is read by the distro's PipeWire exactly as /etc/wireplumber is by
         # WirePlumber, so a system-wide drop-in reaches every user session without touching
@@ -70,7 +88,6 @@ in
           builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
 
         "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-        "wireplumber/wireplumber.conf.d/52-nixaudio-fabric.conf".text = cfg.fabric.wireplumberConfig;
       };
     })
   ];

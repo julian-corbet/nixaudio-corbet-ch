@@ -59,6 +59,7 @@ DISCOVER_EVERY = 60          # the peer-discovery pass (reachability probes on t
 SETTLE = 1.5                 # seconds to let a device-change burst settle before the trailing reconcile
 TIMEOUT = 6
 FABRIC_LOOP = _CFG.get("loop", "fabric-loop.0")  # tunnels are pinned to this own data-loop so a stall can't wedge hardware audio
+MIRROR_PRIORITY = _CFG.get("mirrorPriority", 0)  # a mirror must lose the default-sink race to real local hardware
 HEAL_FAILS = 3               # consecutive unresponsive-pulse ticks before self-heal restarts the audio stack
 HEAL_COOLDOWN = 300          # min seconds between self-heal restarts (anti-flap)
 
@@ -228,12 +229,26 @@ def reconcile_peer(ip, host):
             continue
         mod = "module-tunnel-sink" if kind == "sink" else "module-tunnel-source"
         key = "sink" if kind == "sink" else "source"
-        # Pin the tunnel to its own data-loop (fabric-loop.0) so a stall can't wedge the hardware loop.
-        # (pactl can't carry both node.loop.name AND device.description in one sink_properties — the loop
-        # pin is load-bearing, so the device falls back to the default tunnel description.)
+        # Two properties, and the QUOTES INSIDE THE VALUE are load-bearing:
+        #
+        #   {key}_properties="a=1 b=2"   both parse
+        #   {key}_properties=a=1 b=2     only `a` parses, `b` is silently dropped
+        #   {key}_properties={a=1 b=2}   neither parses; the whole value is silently ignored
+        #
+        # Measured against a live pipewire-pulse, not assumed -- the unquoted form is what this
+        # daemon used to send, which is why only the first property ever took effect.
+        #
+        #   node.loop.name    pins the tunnel to its own data-loop so a stalled remote cannot wedge
+        #                     the loop local hardware audio runs on.
+        #   priority.session  makes a MIRROR lose the default-sink race to real local hardware. This
+        #                     used to be attempted from a WirePlumber `stream.rules` fragment and
+        #                     never worked: these tunnels are created by pipewire-pulse, not by a
+        #                     WirePlumber monitor, so no monitor rule is ever evaluated against
+        #                     them, and `stream.rules` governs streams rather than sink nodes. Set
+        #                     at creation it lands -- verified with pw-dump.
+        props = f"{key}_properties=\"node.loop.name={FABRIC_LOOP} priority.session={MIRROR_PRIORITY}\""
         pactl(["load-module", mod, f"server=tcp:{ip}:{PORT}", f"{key}={dev}",
-               f"{key}_name={lname}", "reconnect_interval_ms=15000",
-               f"{key}_properties=node.loop.name={FABRIC_LOOP}"])
+               f"{key}_name={lname}", "reconnect_interval_ms=15000", props])
         log(f"+ {lname} ({label})")
     # unload only THIS peer's stale tunnels (peer enumerated OK -> vanished devices are truly gone)
     for lname, mid in loaded_fabric(prefix="fabric").items():
@@ -304,15 +319,64 @@ def unload_peer(ip):
 
 
 def pulse_alive():
-    """Cheap local liveness probe: does pipewire-pulse answer pactl within a few seconds?"""
+    """Cheap local liveness probe: does pipewire-pulse answer pactl within a few seconds?
+
+    DELIBERATELY NOT A GRAPH-HEALTH CHECK, and this needs saying because the obvious "improvement"
+    is to make it one. During the 2026-08-11 outage this probe answered YES for 1h45m while the
+    graph had zero ALSA devices -- pipewire-pulse was perfectly responsive, it simply had nothing to
+    offer -- so `fails` reset every tick and heal() never fired again after the restart that caused
+    the damage.
+
+    The fix for that is NOT here. This daemon has no business deciding what a healthy device set
+    looks like: on one host in this estate the correct steady state is three ALSA devices for four
+    kernel cards, and on another a card is disabled on purpose. `nixaudio.guard` owns that predicate,
+    runs on every wireplumber start, and therefore also covers the restart heal() issues -- so
+    duplicating it here would add a second, worse copy of a rule that has to be right.
+
+    What this probe is for is narrower and still correct: is the local pulse layer answering at all.
+    """
     return run(["pactl", "info"], timeout=4).returncode == 0
 
 
 def heal(watchers):
-    """Self-heal a wedged local pulse: restart the user audio stack (the proven recovery one-liner). The
-    daemon is a separate user service; it drops its stale watchers and re-mirrors afterwards."""
-    log("local pulse unresponsive — self-heal: restarting the audio stack")
-    run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"], timeout=25)
+    """Self-heal a wedged local pulse by restarting ONE unit: pipewire.service.
+
+    THIS FUNCTION CAUSED A 1h45m TOTAL AUDIO OUTAGE. It used to name all three units --
+    `systemctl --user restart pipewire pipewire-pulse wireplumber` -- and that is what broke the
+    graph, so the change here is the fix for the incident, not a tidy-up.
+
+    Naming three units asks systemd for three independent restart jobs and throws away the ordering
+    the vendor units already declare. Both pipewire-pulse.service and wireplumber.service carry
+    `BindsTo=pipewire.service` and `After=pipewire.service`, and wireplumber is `WantedBy=
+    pipewire.service`. Restarting pipewire.service ALONE therefore stops the other two first (the
+    reverse of After=), restarts the daemon, and pulls them back up in order -- one job, correct
+    sequence, no overlap. That is what the unit graph is for.
+
+    WHAT THE THREE-UNIT FORM DID INSTEAD. On 2026-08-11 a system-wide btrfs transaction stall put
+    wireplumber into uninterruptible D state inside its own state-file save (the orphaned zero-byte
+    `~/.local/state/wireplumber/*.<tmp>` files are the fingerprint, and there are ~19 of them going
+    back weeks -- this stall is routine, not exotic). `pactl info` stopped answering, three ticks
+    later this function fired, and systemd could not kill the old wireplumber: a task in D state
+    never reaches signal delivery, so SIGKILL was queued twice and ignored. After 40s systemd gave
+    up, logged `Found left-over process ... Ignoring`, and started a SECOND wireplumber while the
+    first still held the ALSA cards -- and, decisively, still owned every
+    org.freedesktop.ReserveDevice1.AudioN name. The new instance asked for those reservations, the
+    frozen owner never answered RequestRelease, the acquire transition timed out into BUSY, and
+    WirePlumber's ALSA monitor therefore never called createDevice for a single card. Zero ALSA
+    devices, for 1h45m, until a human restarted wireplumber by hand.
+
+    No systemd setting fixes that: SIGKILL is already the final signal, D state ignores it, and
+    there is no option that makes a unit refuse to start while its cgroup is non-empty (that log
+    line is advisory only). `TimeoutStopSec=infinity` would turn a degraded stack into an
+    indefinite one. So the answer is not to kill harder -- it is to issue ONE job that systemd can
+    sequence, and to have `nixaudio.monitor.guard` notice and repair the deviceless graph that
+    results when even that is not enough. The restart is one half of the recovery; the guard is the
+    half that checks the recovery worked.
+
+    The daemon is a separate user service, so it survives the restart; it drops its stale watchers
+    here and re-mirrors on the next tick."""
+    log("local pulse unresponsive — self-heal: restarting pipewire.service (pulse + wireplumber follow)")
+    run(["systemctl", "--user", "restart", "pipewire.service"], timeout=25)
     for ip in list(watchers):
         watchers[ip][1].set()
     watchers.clear()

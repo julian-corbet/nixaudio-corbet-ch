@@ -17,13 +17,26 @@
 # The real invariant is RELATIONAL: if a peer is reachable AND offers at least one real
 # (non-mirrored) device, this host must hold at least one tunnel to it. Anything else is a genuine
 # failure — a wedged daemon, a half-open listener, a peer that answers TCP but not pulse.
+#
+# WHAT THIS PROBE STILL CANNOT SEE, AND WHO DOES INSTEAD
+#
+# A peer whose own PipeWire has lost every ALSA device answers TCP, answers pulse, and offers zero
+# real devices — so `real=0` and this check skips it as healthy. That is the exact shape of the
+# 2026-08-11 outage, and this probe was structurally incapable of catching it. It is not fixed here,
+# because it cannot be: from across the fabric, "a peer with no cards" and "a peer whose cards are
+# all legitimately absent right now" are the same observation. It is fixed at the only place that
+# CAN tell them apart, on the peer itself — see ./guard.nix.
+#
+# Two things that ARE this probe's business were broken and are fixed below: it could not reach the
+# local graph at all when run by a scheduler, and it tested the listener by asking for a module
+# object rather than a socket.
 { lib, options, config, pkgs, ... }:
 let
   cfg = config.nixaudio.fabric;
 
   probe = pkgs.writeShellApplication {
     name = "nixaudio-fabric-health";
-    runtimeInputs = [ pkgs.pulseaudio pkgs.jq ];
+    runtimeInputs = [ pkgs.pulseaudio pkgs.jq pkgs.iproute2 ];
     text = ''
       config_file="''${NIXAUDIO_FABRIC_CONFIG:-/etc/nixaudio/fabric.json}"
       if [ ! -r "$config_file" ]; then
@@ -34,6 +47,56 @@ let
       port=$(jq -r '.port // 4713' "$config_file")
       unhealthy=0
       checked=0
+
+      # ── FIND THE GRAPH THIS PROBE IS SUPPOSED TO BE ASKING ABOUT ─────────────────────────────
+      #
+      # This probe reports on a USER's PipeWire graph, and it is very often not run BY that user:
+      # a scheduler runs it as root. Bare `pactl` then talks to root's own (non-existent) session,
+      # gets "Connection refused" for every local query, and the local arm silently evaluates to
+      # zero -- which reads as "this host holds no tunnels", i.e. permanently unhealthy.
+      #
+      # That is not hypothetical. On the host where this was first scheduled, the check latched into
+      # a DOWN state on its very first run and stayed there for nine days without a second alert,
+      # because the alerting wrapper only fires on a transition. It was blind for the entire window
+      # in which the fabric actually broke.
+      #
+      # So: find the session's runtime directory rather than assuming we are in it. One
+      # pulse socket means one session and no ambiguity; several means the host must say which.
+      if [ -z "''${PULSE_RUNTIME_PATH:-}" ] && [ ! -S "''${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native" ]; then
+        mapfile -t sockets < <(find /run/user -mindepth 3 -maxdepth 3 -path '*/pulse/native' 2>/dev/null)
+        if [ "''${#sockets[@]}" -eq 1 ]; then
+          PULSE_RUNTIME_PATH="$(dirname "''${sockets[0]}")"
+          export PULSE_RUNTIME_PATH
+        elif [ "''${#sockets[@]}" -eq 0 ]; then
+          echo "fabric: no PipeWire session found (looked for /run/user/*/pulse/native)" >&2
+          exit 1
+        else
+          echo "fabric: ''${#sockets[@]} PipeWire sessions on this host; set PULSE_RUNTIME_PATH to pick one" >&2
+          exit 1
+        fi
+      fi
+
+      # Fail loudly rather than silently scoring every peer as unmirrored, which is the exact shape
+      # of the nine-day false negative above.
+      if ! pactl info >/dev/null 2>&1; then
+        echo "fabric: cannot reach the local PipeWire graph (PULSE_RUNTIME_PATH=''${PULSE_RUNTIME_PATH:-unset})" >&2
+        exit 1
+      fi
+
+      # ── THE LOCAL LISTENER MUST BE A SOCKET, NOT A MODULE OBJECT ─────────────────────────────
+      #
+      # `pactl list modules` is NOT a valid test that peers can reach this host. pipewire-pulse
+      # creates and registers the module object BEFORE attempting the bind and does not unregister
+      # it when the bind fails -- so a failed listener leaves a module that looks loaded forever.
+      # Measured live: two module-native-protocol-tcp objects with identical arguments, one actual
+      # socket. Ask the kernel instead.
+      listen=$(jq -r '.listen // empty' "$config_file")
+      if [ -n "$listen" ] && [ "$listen" != "any" ]; then
+        if ! ss -H -ltn | awk '{print $4}' | grep -qxF "$listen:$port"; then
+          echo "fabric: nothing is listening on $listen:$port — no peer can reach this host" >&2
+          unhealthy=$((unhealthy + 1))
+        fi
+      fi
 
       while read -r peer_host; do
         [ -n "$peer_host" ] || continue

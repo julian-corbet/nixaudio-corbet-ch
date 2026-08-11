@@ -36,27 +36,94 @@ in
 {
   imports = [
     ../modules/devices.nix
+    ../modules/dropins.nix
     ../modules/fabric.nix
     ../modules/catalogue.nix
     ../modules/daemon.nix
+    ../modules/guard.nix
   ];
 
-  config = lib.mkIf cfg.fabric.enable {
-    xdg.configFile = {
-      # PipeWire and WirePlumber both read drop-ins from the user's XDG config dir, which take
-      # precedence over the distro's own /usr/share defaults without modifying anything pacman owns.
-      "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf".text =
-        builtins.toJSON cfg.fabric.pipewireConfig."50-fabric-loops";
+  config = lib.mkMerge [
+    # This plane writes the user's own XDG config, so on a host where it is the ONLY nixaudio plane
+    # it must place the fragments. Where a system plane is composed too, that one should win and
+    # this host has to say so -- once, in a file both trees import. ../modules/dropins.nix has the
+    # failure that follows from both writing.
+    { nixaudio.dropIns = lib.mkDefault "user"; }
 
-      "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf".text =
-        builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
+    # ── The guard, and why it lives HERE on a non-NixOS host ─────────────────────────────────
+    # It is a `systemd --user` unit, and this is the only plane on such a host with a real one.
+    # system-manager can write /etc/systemd/user, but it never reloads the user manager, so a unit
+    # it writes is inert until the next login -- a guard that arms itself after the next reboot is
+    # not a guard. home-manager's sd-switch reloads and starts what it owns.
+    #
+    # No ConditionUser here, unlike the NixOS projection: a home-manager unit belongs to exactly one
+    # user by construction, so the stray-root-instance hazard that option exists for cannot arise.
+    (lib.mkIf cfg.guard.enable {
+      xdg.configFile = lib.mkIf
+        (cfg.dropIns == "user" && cfg.guard.wireplumberConfig != "")
+        {
+          "wireplumber/wireplumber.conf.d/50-nixaudio-reservation.conf".text =
+            cfg.guard.wireplumberConfig;
+        };
 
-      "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-      "wireplumber/wireplumber.conf.d/52-nixaudio-fabric.conf".text = cfg.fabric.wireplumberConfig;
-    }
-    // lib.optionalAttrs cfg.fabric.daemon.enable {
-      ${configRelPath}.source = cfg.fabric.daemon.configFile;
-    };
+      systemd.user.services.nixaudio-alsa-guard = {
+        Unit = {
+          Description = "Repair a WirePlumber that came up with no ALSA devices (nixaudio)";
+          After = [ "wireplumber.service" ];
+          BindsTo = [ "wireplumber.service" ];
+          PartOf = [ "wireplumber.service" ];
+        };
+
+        Service = {
+          Type = "oneshot";
+          ExecStart = "${cfg.guard.package}/bin/nixaudio-alsa-guard";
+          TimeoutStartSec = cfg.guard.settleSeconds + 60;
+        }
+        // lib.optionalAttrs (cfg.guard.toolPath != [ ]) {
+          # On a distro host the running PipeWire is the DISTRO's, so the client this script calls
+          # must be too -- see nixaudio.guard.toolPath. This is the same anti-shadowing rule
+          # ../lib/packages.nix applies to the daemons.
+          Environment = [ "PATH=${lib.concatStringsSep ":" cfg.guard.toolPath}" ];
+        };
+
+        # WantedBy wireplumber, not default.target: the guard's whole subject is a wireplumber that
+        # has just started, so it should run exactly when one does.
+        Install.WantedBy = [ "wireplumber.service" ];
+      };
+
+      systemd.user.timers = lib.mkIf (cfg.guard.interval != null) {
+        nixaudio-alsa-guard = {
+          Unit.Description = "Periodic re-check for a WirePlumber with no ALSA devices (nixaudio)";
+          Timer = {
+            OnUnitActiveSec = cfg.guard.interval;
+            OnStartupSec = cfg.guard.interval;
+            RandomizedDelaySec = "30s";
+          };
+          Install.WantedBy = [ "timers.target" ];
+        };
+      };
+    })
+
+    (lib.mkIf cfg.fabric.enable {
+    xdg.configFile =
+      # The PipeWire/WirePlumber drop-ins, only when this plane owns them. Both read from the user's
+      # XDG config dir, which takes precedence over the distro's own /usr/share defaults without
+      # modifying anything pacman owns.
+      lib.optionalAttrs (cfg.dropIns == "user") {
+        "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf".text =
+          builtins.toJSON cfg.fabric.pipewireConfig."50-fabric-loops";
+
+        "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf".text =
+          builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
+
+        "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
+      }
+      # The daemon's OWN config file is not a drop-in and is not subject to `dropIns`: this plane
+      # runs the daemon, so this plane must place the file that daemon reads, whichever plane owns
+      # the PipeWire fragments.
+      // lib.optionalAttrs cfg.fabric.daemon.enable {
+        ${configRelPath}.source = cfg.fabric.daemon.configFile;
+      };
 
     systemd.user.services = lib.mkIf cfg.fabric.daemon.enable {
       fabric-sync = {
@@ -81,5 +148,6 @@ in
         Install.WantedBy = [ "default.target" ];
       };
     };
-  };
+    })
+  ];
 }

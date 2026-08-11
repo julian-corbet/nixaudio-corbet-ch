@@ -6,9 +6,11 @@
 {
   imports = [
     ./devices.nix
+    ./dropins.nix
     ./fabric.nix
     ./catalogue.nix
     ./daemon.nix
+    ./guard.nix
     ./monitor.nix
     ./rt.nix
     ./backend.nix

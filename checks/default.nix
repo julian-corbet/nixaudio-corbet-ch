@@ -57,6 +57,7 @@ let
       { options.environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
       { options.hardware.firmware = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
       { options.systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
+      { options.systemd.user.timers = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.security.pam.loginLimits = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
     ] ++ modules;
   };
@@ -86,6 +87,7 @@ let
     options.xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
     options.xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
     options.systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
+    options.systemd.user.timers = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
     options.assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
     options.warnings = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
   };
@@ -177,6 +179,85 @@ let
       # shure: only source overridden -- proves declaring one axis does not also emit a rule (with
       # some default value) for the axis left alone.
       nixaudio.priorities.shure.source = 2200;
+    }
+  ];
+
+  # A priority aimed at ONE node of a card that spawns several. Without the narrowing key, an
+  # internal codec's speakers, and every HDMI output on the same card, all receive one number --
+  # measured live as four sinks collapsing from 1000/696/680/664 into a single value.
+  profiledPriority = eval [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.devices.builtin.match."device.vendor.id" = "0x8086";
+      nixaudio.priorities.builtin.sink = { priority = 1450; profile = "HiFi: Speaker: sink"; };
+    }
+  ];
+
+  # A host that wants declared priority to outrank a remembered `wpctl set-default`.
+  noRestore = eval [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.restoreDefaultTargets = false;
+      nixaudio.devices.internal.match."device.name" = "alsa_card.internal";
+    }
+  ];
+
+  # ── Guard fixtures ──────────────────────────────────────────────────────────────────────────
+  guarded = eval [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.guard.user = "alice";
+    }
+  ];
+
+  # No fabric at all -- the guard must still be there, because losing the ALSA enumeration has
+  # nothing to do with whether this host joins a device pool.
+  backendOnlyGuard = eval [ { nixaudio.backend.enable = true; } ];
+
+  guardOff = eval [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.guard.enable = false;
+    }
+  ];
+
+  guardNoTimer = eval [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixaudio.guard.interval = null;
+    }
+  ];
+
+  # A host that genuinely shares its cards with another sound server and must keep the handshake.
+  reserveOn = eval [ { nixaudio.backend.enable = true; nixaudio.guard.reserveDevice = true; } ];
+
+  # ── dropIns fixtures: the two-planes-one-host case ──────────────────────────────────────────
+  homeSystemDropIns = evalHome [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.host-a.host = "host-a";
+      nixaudio.fabric.daemon.user = "alice";
+      nixaudio.dropIns = "system";
+    }
+  ];
+
+  archUserDropIns = evalArch [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.14";
+      nixaudio.fabric.peers.host-a.host = "host-a";
+      nixaudio.dropIns = "user";
     }
   ];
 
@@ -561,9 +642,149 @@ let
       name = "fabric tunnels get their own data loop";
       ok = composed.config.nixaudio.fabric.pipewireConfig."50-fabric-loops"."context.properties"."context.num-data-loops" == 2;
     }
+    # Mirror deprioritisation moved OUT of a WirePlumber fragment and into the tunnel's own module
+    # properties, because these tunnels are created by pipewire-pulse and no WirePlumber monitor
+    # rule is ever evaluated against them. The old `stream.rules` fragment matched nothing at all on
+    # every host that ran it, so asserting on rendered text would only prove the text exists.
     {
-      name = "mirrored peer devices are deprioritised in default-sink selection";
-      ok = lib.hasInfix "priority.session = 0" composed.config.nixaudio.fabric.wireplumberConfig;
+      name = "mirrored peer devices are deprioritised, via the daemon's tunnel properties";
+      ok = composed.config.nixaudio.fabric.daemon.settings.mirrorPriority == 0;
+    }
+    {
+      name = "the daemon is told the listen address, so the probe can assert a real socket";
+      ok = composed.config.nixaudio.fabric.daemon.settings.listen == "203.0.113.14";
+    }
+
+    # ── The carrier: the ONE mechanism that makes node-level rules possible at all ─────────────
+    #
+    # These exist because the previous generator produced rules that were syntactically fine,
+    # rendered into the file, and matched nothing — on every host, silently, for the module's whole
+    # life. A check that only asserted "a priority rule was rendered" would have passed throughout.
+    # So each of these asserts something about WHICH OBJECT the rule can match.
+    {
+      name = "the device rule mints the carrier, so node rules have something to match";
+      ok = lib.hasInfix ''alsa.nixaudio.device = "hyperx"'' withPriority.config.nixaudio.namingConfig;
+    }
+    {
+      name = "the carrier is in the alsa.* namespace WirePlumber actually copies onto nodes";
+      # Not cosmetic: the copy loop is a prefix filter on `alsa.` / `api.alsa.card.`, so a carrier
+      # minted anywhere else reaches no node and the rules go quietly dead again.
+      ok = lib.hasPrefix "alsa." "alsa.nixaudio.device";
+    }
+    {
+      name = "the priority rule matches the carrier and media.class, never device identity";
+      # The dead shape was `device.vendor.id + media.class`: no device object has media.class and no
+      # node object has device.vendor.id, so it described an object that cannot exist. The rendered
+      # priority rule must therefore contain NO device.* identity key.
+      ok =
+        let
+          rules = withPriority.config.nixaudio.namingConfig;
+          priorityBlocks = builtins.filter
+            (block: lib.hasInfix "priority.session" block)
+            (lib.splitString "}\n{" rules);
+        in
+        priorityBlocks != [ ]
+        && lib.all
+          (block:
+            lib.hasInfix "alsa.nixaudio.device" block
+            && lib.hasInfix "media.class" block
+            && !(lib.hasInfix "device.vendor.id" block)
+            && !(lib.hasInfix "device.bus-id" block))
+          priorityBlocks;
+    }
+    {
+      name = "node.nick is set from a NODE rule, not from the device rule where it is inert";
+      ok =
+        let
+          rules = withPriority.config.nixaudio.namingConfig;
+          nickBlocks = builtins.filter
+            (block: lib.hasInfix "node.nick" block)
+            (lib.splitString "}\n{" rules);
+        in
+        nickBlocks != [ ] && lib.all (block: lib.hasInfix "alsa.nixaudio.device" block) nickBlocks;
+    }
+    {
+      name = "a bare integer priority still works and renders no profile narrowing";
+      ok = !(lib.hasInfix "device.profile.name" withPriority.config.nixaudio.namingConfig);
+    }
+    {
+      name = "a priority aimed at one node of a multi-PCM card renders the profile narrowing";
+      ok = lib.hasInfix ''device.profile.name = "HiFi: Speaker: sink"''
+        profiledPriority.config.nixaudio.namingConfig;
+    }
+    {
+      name = "state restore is left at WirePlumber's own default unless a host says otherwise";
+      ok = !(lib.hasInfix "restore-default-targets" withPriority.config.nixaudio.namingConfig)
+        && lib.hasInfix "node.restore-default-targets = false"
+          noRestore.config.nixaudio.namingConfig;
+    }
+
+    # ── The guard ─────────────────────────────────────────────────────────────────────────────
+    {
+      name = "the guard unit is emitted on the NixOS plane and runs off wireplumber's start";
+      ok =
+        let unit = guarded.config.systemd.user.services.nixaudio-alsa-guard; in
+        unit.wantedBy == [ "wireplumber.service" ]
+        && unit.after == [ "wireplumber.service" ]
+        && unit.bindsTo == [ "wireplumber.service" ]
+        && unit.serviceConfig.Type == "oneshot";
+    }
+    {
+      name = "the guard carries ConditionUser, so a stray root session cannot run it";
+      ok = guarded.config.systemd.user.services.nixaudio-alsa-guard.unitConfig.ConditionUser == "alice";
+    }
+    {
+      name = "the guard is emitted even on a host with the backend but no fabric";
+      # The failure it repairs is a property of the ALSA enumeration, not of the device pool.
+      ok = backendOnlyGuard.config.systemd.user.services ? nixaudio-alsa-guard;
+    }
+    {
+      name = "no guard unit at all when the guard is disabled";
+      ok = !(guardOff.config.systemd.user.services ? nixaudio-alsa-guard)
+        && !(guardOff.config.systemd.user.timers ? nixaudio-alsa-guard);
+    }
+    {
+      name = "the periodic re-check can be turned off without losing the start-triggered one";
+      ok = (guardNoTimer.config.systemd.user.services ? nixaudio-alsa-guard)
+        && !(guardNoTimer.config.systemd.user.timers ? nixaudio-alsa-guard);
+    }
+    {
+      name = "device reservation is disabled by default, in the profile the session actually uses";
+      ok = lib.hasInfix "monitor.alsa.reserve-device = disabled"
+        composed.config.nixaudio.guard.wireplumberConfig
+        && lib.hasInfix "main =" composed.config.nixaudio.guard.wireplumberConfig;
+    }
+    {
+      name = "a host that needs the reservation handshake can keep it, and gets no fragment";
+      ok = reserveOn.config.nixaudio.guard.wireplumberConfig == "";
+    }
+
+    # ── dropIns: exactly one plane may place the fragments ────────────────────────────────────
+    {
+      name = "the NixOS plane claims the fragments by default";
+      ok = composed.config.nixaudio.dropIns == "system"
+        && composed.config.environment.etc ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf";
+    }
+    {
+      name = "the home plane claims them by default when it is the only plane";
+      ok = homePlane.config.nixaudio.dropIns == "user"
+        && homePlane.config.xdg.configFile ? "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf";
+    }
+    {
+      name = "the home plane places NO drop-in when a system plane owns them";
+      # This is the fix for a deterministic, every-single-boot listener failure: PipeWire
+      # CONCATENATES array sections across search roots, so two copies of the pulse fragment load
+      # module-native-protocol-tcp twice and the second bind always fails.
+      ok = !(homeSystemDropIns.config.xdg.configFile ? "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf")
+        && !(homeSystemDropIns.config.xdg.configFile ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf");
+    }
+    {
+      name = "the home plane still places the daemon's OWN config, which is not a drop-in";
+      ok = homeSystemDropIns.config.xdg.configFile ? "nixaudio/fabric.json";
+    }
+    {
+      name = "the system-manager plane places no drop-in when the user plane owns them";
+      ok = !(archUserDropIns.config.environment.etc ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf");
     }
     {
       name = "evaluates with neither nixusb nor nixnet composed";

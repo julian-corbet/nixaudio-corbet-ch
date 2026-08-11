@@ -39,6 +39,35 @@
       lib.packages = import ./lib/packages.nix { };
       lib.resolve = import ./lib/resolve.nix { inherit lib; };
 
+      # The two diagnostics, runnable without composing anything. Both are ordinarily wired into a
+      # unit or a scheduler by a plane, but the whole point of a health probe is that a human can
+      # ask the question directly when something is wrong -- `nix run .#alsa-guard` answers "does
+      # this session have its cards" on any host, including one that has never heard of this flake.
+      packages = forAllSystems (system:
+        let
+          pkgs = pkgsFor system;
+          moduleEval = lib.evalModules {
+            specialArgs = { inherit pkgs; };
+            modules = [
+              ./modules/guard.nix
+              ./modules/monitor.nix
+              ./modules/devices.nix
+              ./modules/dropins.nix
+              ./modules/fabric.nix
+              ./modules/catalogue.nix
+              ./modules/daemon.nix
+              { options.environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
+              { options.assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
+              { options.warnings = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; }; }
+            ];
+          };
+        in
+        {
+          alsa-guard = moduleEval.config.nixaudio.guard.package;
+          fabric-health = moduleEval.config.nixaudio.fabric.healthCheck;
+          default = moduleEval.config.nixaudio.guard.package;
+        });
+
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;

@@ -52,7 +52,12 @@ let
 
   fabricConfig = {
     port = cfg.listen.port;
+    # The daemon itself never dials this -- it is here for ../modules/monitor.nix, which has to
+    # assert that the address peers are told to reach is genuinely in LISTEN state. Publishing it
+    # through the one generated file both already read beats giving the probe its own config.
+    listen = cfg.listen.address;
     loop = cfg.loopName;
+    mirrorPriority = cfg.mirrorPriority;
     peers = peerTable;
   };
 in

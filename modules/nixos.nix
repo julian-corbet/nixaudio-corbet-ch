@@ -1,10 +1,83 @@
 # NixOS plane: project the generated config through services.pipewire, the idiomatic path here.
-{ lib, config, ... }:
+{ lib, config, pkgs, ... }:
 let
   cfg = config.nixaudio;
 in
 {
-  config = lib.mkIf cfg.fabric.enable {
+  config = lib.mkMerge [
+    # `dropIns` defaults to "system" here: this plane can write /etc, which every session on the
+    # host reads, so a NixOS host that ALSO runs home-manager should let the system copy be the only
+    # one. See ./dropins.nix for what happens when both write.
+    { nixaudio.dropIns = lib.mkDefault "system"; }
+
+    # ── The guard is gated on ITSELF, not on the fabric ───────────────────────────────────────
+    # A host can declare its audio backend without joining any device pool (that is exactly what
+    # `backend.enable` without `fabric.enable` means), and such a host loses its ALSA enumeration
+    # the same way. Everything below this block is fabric machinery and stays gated on the fabric.
+    (lib.mkIf cfg.guard.enable {
+      systemd.user.services.nixaudio-alsa-guard = {
+        description = "Repair a WirePlumber that came up with no ALSA devices (nixaudio)";
+
+        # Pulled in BY wireplumber and stopped WITH it, so it runs once per wireplumber start --
+        # which is the moment the failure it looks for is actually created. `bindsTo` rather than
+        # `requires` so it never tries to start wireplumber itself; the guard has no opinion about
+        # whether audio should be running, only about whether a running session manager found its
+        # cards.
+        after = [ "wireplumber.service" ];
+        bindsTo = [ "wireplumber.service" ];
+        partOf = [ "wireplumber.service" ];
+        wantedBy = [ "wireplumber.service" ];
+
+        # ConditionUser, for the same reproduced incident this repo's consumers already patch
+        # fabric-sync for: systemd.user.services installs into EVERY user's manager, and a root
+        # login would otherwise run a guard against a session it cannot see, find no graph, and
+        # start restarting another user's wireplumber.
+        # optionalAttrs rather than mkIf: this is a plain attribute of a unit definition, not an
+        # option definition that needs a priority, and mkIf here would leave an unresolved `_type =
+        # "if"` wrapper anywhere the unit is read as data rather than merged as a submodule.
+        unitConfig = lib.optionalAttrs (cfg.guard.user != null) {
+          ConditionUser = cfg.guard.user;
+        };
+
+        # nixpkgs' own PipeWire closure, because on NixOS that is also the daemon that is running
+        # -- the client and the server come from one package set. See nixaudio.guard.toolPath.
+        path = lib.optionals (cfg.guard.toolPath == [ ]) [ pkgs.pipewire pkgs.jq pkgs.systemd ];
+
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${cfg.guard.package}/bin/nixaudio-alsa-guard";
+          # The script polls for up to settleSeconds and then acts once; this is a backstop against
+          # a pw-dump that never returns, not the normal bound.
+          TimeoutStartSec = cfg.guard.settleSeconds + 60;
+        }
+        // lib.optionalAttrs (cfg.guard.toolPath != [ ]) {
+          Environment = [ "PATH=${lib.concatStringsSep ":" cfg.guard.toolPath}" ];
+        };
+      };
+
+      systemd.user.timers = lib.mkIf (cfg.guard.interval != null) {
+        nixaudio-alsa-guard = {
+          description = "Periodic re-check for a WirePlumber with no ALSA devices (nixaudio)";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnUnitActiveSec = cfg.guard.interval;
+            OnStartupSec = cfg.guard.interval;
+            # Every host firing at the same instant would restart the whole fabric at once; the
+            # failure is not time-critical, so smear it.
+            RandomizedDelaySec = "30s";
+          };
+        };
+      };
+
+      environment.etc = lib.mkIf
+        (cfg.dropIns == "system" && cfg.guard.wireplumberConfig != "")
+        {
+          "wireplumber/wireplumber.conf.d/50-nixaudio-reservation.conf".text =
+            cfg.guard.wireplumberConfig;
+        };
+    })
+
+    (lib.mkIf cfg.fabric.enable {
     services.pipewire = {
       enable = lib.mkDefault true;
       alsa.enable = lib.mkDefault true;
@@ -19,9 +92,8 @@ in
     # WirePlumber rules go through /etc rather than services.pipewire.wireplumber.configPackages so
     # that the exact same rendered text is used on both planes -- a system-manager host has no
     # configPackages equivalent, and one rendering is easier to reason about than two.
-    environment.etc = {
+    environment.etc = lib.optionalAttrs (cfg.dropIns == "system") {
       "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-      "wireplumber/wireplumber.conf.d/52-nixaudio-fabric.conf".text = cfg.fabric.wireplumberConfig;
     }
     // lib.optionalAttrs cfg.fabric.daemon.enable {
       "nixaudio/fabric.json".source = cfg.fabric.daemon.configFile;
@@ -45,5 +117,6 @@ in
         };
       };
     };
-  };
+    })
+  ];
 }
