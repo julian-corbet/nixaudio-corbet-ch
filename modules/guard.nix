@@ -57,7 +57,7 @@
 # here, and would have this thing restarting wireplumber forever:
 #
 #   * A card with no PCM device at all is dropped by PipeWire's own ALSA plugin permanently
-#     (`card->ignored`), and one such card exists on two of this fleet's three hosts.
+#     (`card->ignored`), and one such card exists on two of the three hosts this was built against.
 #   * A card can be excluded ON PURPOSE. One host disables its GPU's HDMI audio function outright
 #     with a `device.disabled = true` rule, because a container on the same box holds the same
 #     kernel device. That is correct configuration, and an equality check would read it as damage.
@@ -94,7 +94,7 @@
 #
 # Projected by ./nixos.nix and ../home/fabric-sync.nix, and NOT by ../system-manager/default.nix —
 # the same split ../modules/daemon.nix's fabric-sync already follows, for a sharper reason than
-# symmetry. system-manager can WRITE `/etc/systemd/user/*.service` (a consumer in this estate does
+# symmetry. system-manager can WRITE `/etc/systemd/user/*.service` (a consumer of this flake does
 # exactly that for an ordering shim), but it never reloads the user manager, so a unit it writes is
 # inert until the next login. A guard that only arms itself after the next reboot is not a guard.
 # home-manager's `sd-switch` does reload and restart what it owns, and NixOS owns the user manager
@@ -281,7 +281,7 @@ in
         This is a readiness contract stood in for a missing one: neither WirePlumber nor PipeWire
         implements `sd_notify`, and there is no signal for "the first ALSA enumeration finished", so
         the only honest thing to wait for is the condition itself. Measured settle on the slowest
-        host in this estate is ~2.4s. The default is deliberately many times that, because the two
+        host this was measured on is ~2.4s. The default is deliberately many times that, because the two
         errors are not symmetric — waiting too long costs a few more seconds of silence in a case
         that was already going to need repair, while deciding too early restarts a session manager
         that was merely still enumerating.

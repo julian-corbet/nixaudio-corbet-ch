@@ -83,7 +83,7 @@
 #
 # NUMBER SPACE: positive integers only (`>= 1`), no declared ceiling.
 #   - Zero and below are refused by the option's own type, on purpose. `modules/fabric.nix`'s
-#     `mirrorPriorityConfig` stamps `priority.session = 0` onto every mirrored fabric node so real
+#     `mirrorPriority` stamps `priority.session = 0` onto every mirrored fabric node so real
 #     hardware always wins the default-node race against a tunnel (see that module's header). A
 #     locally-declared priority of 0 would tie a piece of REAL hardware with a DEPRIORITISED MIRROR —
 #     the exact failure that scheme exists to prevent — so this option cannot express it at all,
@@ -470,7 +470,7 @@ in
               declared here; `restoreDefaultTargets` is where that interaction is described.
 
               Must be a positive integer (`>= 1`); the type itself refuses 0 and below, because 0 is
-              what `modules/fabric.nix`'s `mirrorPriorityConfig` stamps onto a deprioritised mirror,
+              what `modules/fabric.nix`'s `mirrorPriority` stamps onto a deprioritised mirror,
               and a local device tied with that would defeat the whole point of that scheme.
             '';
           };

@@ -30,7 +30,8 @@
 #   - the CATALOGUE  (catalogue.nix)   — stable NAMES a consumer can look up, never a binding.
 #   - the TUNNELS     (this file, daemon.nix) — the pipes standing up, so routing has somewhere to go.
 #   - PERMISSIONS     (listen.address, the shared cookie) — who may reach the graph at all.
-#   - DEFAULT priorities (mirrorPriorityConfig, below) — a tie-breaker for an unopinionated app, not
+#   - DEFAULT priorities (`mirrorPriority`, below, applied where the tunnel is created rather than
+#     from a WirePlumber rule that never matched one) — a tie-breaker for an unopinionated app, not
 #     a pin: Sunshine's default-sink race is settled here, but the moment an app (or a human, via
 #     `wpctl`/`pw-link`) makes an explicit choice, that choice wins, exactly as it would for any
 #     other PipeWire client.

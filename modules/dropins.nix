@@ -4,7 +4,7 @@
 #
 # A host may legitimately compose TWO of this flake's planes at once: the system one to place config
 # where every session reads it, and the home-manager one because that is the only plane with a
-# `systemd --user` primitive to run the fabric daemon. Both Arch hosts in the estate this was
+# `systemd --user` primitive to run the fabric daemon. Both Arch hosts this was
 # written for do exactly that, and until this option existed BOTH of them wrote the same four
 # fragment basenames — one set into `/etc`, one into `~/.config`.
 #
@@ -42,7 +42,7 @@
 # ── SETTING IT ONCE FOR BOTH TREES ──────────────────────────────────────────────────────────────
 #
 # Because it must AGREE across two trees, do not set it twice. Put it in whatever file the consumer
-# already imports into every plane — the estate this came from keeps a single shared audio module
+# already imports into every plane — the hosts this came from keep a single shared audio module
 # imported unchanged by the system tree and the home tree precisely so that facts which must be
 # byte-identical across planes have one home. A value stated in two places is a value that will
 # eventually differ in two places.

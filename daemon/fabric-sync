@@ -369,7 +369,7 @@ def heal(watchers):
     there is no option that makes a unit refuse to start while its cgroup is non-empty (that log
     line is advisory only). `TimeoutStopSec=infinity` would turn a degraded stack into an
     indefinite one. So the answer is not to kill harder -- it is to issue ONE job that systemd can
-    sequence, and to have `nixaudio.monitor.guard` notice and repair the deviceless graph that
+    sequence, and to have `nixaudio.guard` notice and repair the deviceless graph that
     results when even that is not enough. The restart is one half of the recovery; the guard is the
     half that checks the recovery worked.
 
