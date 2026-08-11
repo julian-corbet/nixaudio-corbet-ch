@@ -49,6 +49,14 @@ in
           # The script polls for up to settleSeconds and then acts once; this is a backstop against
           # a pw-dump that never returns, not the normal bound.
           TimeoutStartSec = cfg.guard.settleSeconds + 60;
+          # Being SIGTERMed is a NORMAL outcome here, not a failure. The guard is PartOf
+          # wireplumber, so stopping wireplumber stops the guard -- and during a RESTART that lands
+          # on a guard still inside its settle poll, which systemd would otherwise record as
+          # `Failed with result 'signal'` after every single restart. A unit that shows failed when
+          # nothing failed is precisely the kind of signal people learn to ignore, which is the
+          # habit that let the fabric health check sit latched for ten days. A real fault still
+          # exits 1 and still shows failed.
+          SuccessExitStatus = "SIGTERM";
         }
         // lib.optionalAttrs (cfg.guard.toolPath != [ ]) {
           Environment = [ "PATH=${lib.concatStringsSep ":" cfg.guard.toolPath}" ];

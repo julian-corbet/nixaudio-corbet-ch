@@ -78,6 +78,10 @@ in
           Type = "oneshot";
           ExecStart = "${cfg.guard.package}/bin/nixaudio-alsa-guard";
           TimeoutStartSec = cfg.guard.settleSeconds + 60;
+          # Stopping wireplumber stops this (PartOf), and during a restart that arrives while the
+          # guard is still in its settle poll -- which systemd records as a failure unless told
+          # otherwise. See the NixOS projection for why a false failed state is worth one line.
+          SuccessExitStatus = "SIGTERM";
         }
         // lib.optionalAttrs (cfg.guard.toolPath != [ ]) {
           # On a distro host the running PipeWire is the DISTRO's, so the client this script calls
