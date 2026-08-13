@@ -1,0 +1,24 @@
+[package]
+name = "nixaudio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Semantic PipeWire control plane for local and network audio devices"
+
+[dependencies]
+anyhow = "1.0"
+futures-util = "0.3"
+hostname = "0.4"
+ksni = "0.3.6"
+md5 = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+zbus = { version = "5.5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3.19"
+
+[profile.release]
+lto = "thin"
+strip = true

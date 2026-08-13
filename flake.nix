@@ -30,7 +30,7 @@
       # config lives under ~/.config, and the daemon is a `systemd --user` unit. nixarch's package
       # reconciler is pacman convergence only and cannot place files or user units, so this is the
       # mechanism that reaches those two nodes.
-      homeManagerModules.nixaudio = import ./home/fabric-sync.nix;
+      homeManagerModules.nixaudio = import ./home/default.nix;
       homeManagerModules.default = self.homeManagerModules.nixaudio;
 
       # The backend table and its resolution, exposed so a consumer can inspect or validate them
@@ -63,9 +63,10 @@
           };
         in
         {
+          nixaudio = import ./package.nix { inherit pkgs; };
           alsa-guard = moduleEval.config.nixaudio.guard.package;
           fabric-health = moduleEval.config.nixaudio.fabric.healthCheck;
-          default = moduleEval.config.nixaudio.guard.package;
+          default = self.packages.${system}.nixaudio;
         });
 
       checks = forAllSystems (system:

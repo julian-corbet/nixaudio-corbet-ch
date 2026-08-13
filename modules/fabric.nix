@@ -312,7 +312,7 @@ in
         pipewire-pulse; no WirePlumber MONITOR ever sees them, so no `monitor.*.rules` section can
         match them. The previous attempt used `stream.rules`, which governs streams rather than sink
         nodes, and therefore matched nothing at all — measured live, every mirror on the host
-        carried no `priority.session` whatsoever. `../daemon/fabric-sync` now passes it in the
+        carried no `priority.session` whatsoever. nixaudiod now passes it in the
         module's own `sink_properties` / `source_properties`, where it lands.
 
         HONEST LIMIT, unchanged: this lowers priority, which settles the race wherever real hardware

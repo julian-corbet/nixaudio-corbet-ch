@@ -84,8 +84,7 @@ let
     cfg.resolvedDevices);
 
   # One entry per (peer, fleet-shared USB device) pair. `<peer>.<device>` mirrors the same pairing
-  # the daemon's own tunnel description already carries (a mirrored sink's label is stamped
-  # "<peer-name> <device description>" — see daemon/fabric-sync's `label`), but as a name a consumer
+  # nixaudiod exposes for the live tunnel, but as a name a consumer
   # can look up BEFORE any tunnel exists, rather than a string parsed back out of one afterwards.
   peerEntries = lib.listToAttrs (lib.flatten (lib.mapAttrsToList
     (peerName: _:

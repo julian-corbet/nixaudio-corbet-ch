@@ -38,7 +38,7 @@ let
     name = "nixaudio-fabric-health";
     runtimeInputs = [ pkgs.pulseaudio pkgs.jq pkgs.iproute2 ];
     text = ''
-      config_file="''${NIXAUDIO_FABRIC_CONFIG:-/etc/nixaudio/fabric.json}"
+      config_file="''${NIXAUDIO_CONFIG:-/etc/nixaudio/config.json}"
       if [ ! -r "$config_file" ]; then
         echo "fabric: no config at $config_file"
         exit 1

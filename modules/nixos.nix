@@ -11,10 +11,10 @@ in
     { nixaudio.dropIns = lib.mkDefault "system"; }
 
     {
-      assertions = lib.optional (cfg.fabric.enable && cfg.fabric.daemon.enable) {
-        assertion = cfg.fabric.daemon.user != null;
+      assertions = lib.optional cfg.daemon.enable {
+        assertion = cfg.daemon.user != null;
         message = ''
-          nixaudio.fabric.daemon.user must name the NixOS user whose PipeWire graph fabric-sync
+          nixaudio.daemon.user must name the NixOS user whose PipeWire graph nixaudiod
           manages when the daemon is enabled.
         '';
       };
@@ -22,15 +22,15 @@ in
 
     # NixOS installs user units into every user's manager. State the intended owner once and use it
     # for all three mechanisms that make a headless audio session reliable: device access, lingering
-    # and ConditionUser fences on both fabric-sync and the ALSA guard.
+    # and ConditionUser fences on both nixaudiod and the ALSA guard.
     (lib.mkIf
-      (cfg.fabric.enable && cfg.fabric.daemon.enable && cfg.fabric.daemon.user != null)
+      (cfg.daemon.enable && cfg.daemon.user != null)
       {
-        users.users.${cfg.fabric.daemon.user} = {
+        users.users.${cfg.daemon.user} = {
           extraGroups = [ "audio" ];
           linger = true;
         };
-        nixaudio.guard.user = lib.mkDefault cfg.fabric.daemon.user;
+        nixaudio.guard.user = lib.mkDefault cfg.daemon.user;
       })
 
     # ── The guard is gated on ITSELF, not on the fabric ───────────────────────────────────────
@@ -52,7 +52,7 @@ in
         wantedBy = [ "wireplumber.service" ];
 
         # ConditionUser, for the same reproduced incident this repo's consumers already patch
-        # fabric-sync for: systemd.user.services installs into EVERY user's manager, and a root
+        # nixaudiod for: systemd.user.services installs into EVERY user's manager, and a root
         # login would otherwise run a guard against a session it cannot see, find no graph, and
         # start restarting another user's wireplumber.
         # optionalAttrs rather than mkIf: this is a plain attribute of a unit definition, not an
@@ -126,31 +126,41 @@ in
       environment.etc = lib.optionalAttrs (cfg.dropIns == "system")
         {
           "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-        }
-      // lib.optionalAttrs cfg.fabric.daemon.enable {
-        "nixaudio/fabric.json".source = cfg.fabric.daemon.configFile;
+        };
+    })
+
+    (lib.mkIf cfg.daemon.enable {
+      environment.systemPackages = [ cfg.daemon.package ];
+      environment.etc."nixaudio/config.json".source = cfg.daemon.configFile;
+      systemd.user.services.nixaudiod = {
+        description = "nixaudio PipeWire control plane";
+        after = [ "pipewire-pulse.service" ];
+        wants = [ "pipewire-pulse.service" ];
+        wantedBy = [ "default.target" ];
+        path = [ pkgs.coreutils pkgs.pipewire pkgs.pulseaudio ];
+        environment.NIXAUDIO_CONFIG = "/etc/nixaudio/config.json";
+        unitConfig = lib.optionalAttrs (cfg.daemon.user != null) { ConditionUser = cfg.daemon.user; };
+        serviceConfig = {
+          ExecStart = "${cfg.daemon.package}/bin/nixaudiod";
+          Restart = "always";
+          RestartSec = 5;
+        };
       };
+    })
 
-      systemd.user.services = lib.mkIf cfg.fabric.daemon.enable {
-        fabric-sync = {
-          description = "Audio fabric device mirror (nixaudio)";
-          # Wants, not Requires: pipewire-pulse is socket-activated, and the daemon's own self-heal
-          # handles a pulse that goes away later. A hard Requires would take the daemon down with it.
-          after = [ "pipewire-pulse.service" ];
-          wants = [ "pipewire-pulse.service" ];
-          wantedBy = [ "default.target" ];
-
-          environment.NIXAUDIO_FABRIC_CONFIG = "/etc/nixaudio/fabric.json";
-
-          unitConfig = lib.optionalAttrs (cfg.fabric.daemon.user != null) {
-            ConditionUser = cfg.fabric.daemon.user;
-          };
-
-          serviceConfig = {
-            ExecStart = "${cfg.fabric.daemon.package}/bin/fabric-sync";
-            Restart = "always";
-            RestartSec = 5;
-          };
+    (lib.mkIf cfg.tray.enable {
+      environment.systemPackages = [ cfg.tray.package ];
+      systemd.user.services.nixaudio-tray = {
+        description = "nixaudio StatusNotifier frontend";
+        after = [ "nixaudiod.service" ];
+        wants = [ "nixaudiod.service" ];
+        partOf = [ "graphical-session.target" ];
+        wantedBy = [ "graphical-session.target" ];
+        unitConfig = lib.optionalAttrs (cfg.daemon.user != null) { ConditionUser = cfg.daemon.user; };
+        serviceConfig = {
+          ExecStart = "${cfg.tray.package}/bin/nixaudio-tray";
+          Restart = "on-failure";
+          RestartSec = 2;
         };
       };
     })

@@ -14,7 +14,7 @@
 #      its own atomic state-file save. (This is routine, not exotic: the orphaned zero-byte
 #      `~/.local/state/wireplumber/*.<tmp>` files each mark one unclean kill, and there were ~19 of
 #      them spanning weeks.)
-#   2. `pactl info` stopped answering, so ../daemon/fabric-sync's self-heal fired and restarted the
+#   2. `pactl info` stopped answering, so the former fabric process restarted the
 #      audio stack.
 #   3. systemd could not kill the old wireplumber. A task in D state never reaches signal delivery,
 #      so SIGKILL was queued twice and ignored; after 40s systemd logged `Found left-over process
@@ -24,11 +24,10 @@
 #      transition timed out into BUSY — and WirePlumber's ALSA monitor only calls `createDevice`
 #      for a reservation that reaches `acquired`. So it created NONE. Not "some": none.
 #   5. Nothing re-checked. WirePlumber builds its ALSA monitor exactly once per process and has no
-#      rescan verb; fabric-sync's liveness probe asks only whether pactl answers, which it did.
+#      rescan verb; the liveness probe asked only whether pactl answered, which it did.
 #
-# Steps 1–4 are each being addressed at their own layer (`nixaudio.reserveDevice` removes the D-Bus
-# arbitration, ../daemon/fabric-sync now restarts ONE unit so systemd can sequence it). This module
-# is step 5, and it is the one that generalises: whatever wedges the enumeration next time, a
+# Steps 1–4 are addressed at their own layer (`nixaudio.reserveDevice` removes the D-Bus
+# arbitration). This module owns step 5, and it is the one that generalises: whatever wedges the enumeration next time, a
 # session manager that is running with an empty graph is always wrong, and always fixed by
 # restarting it.
 #
@@ -92,8 +91,8 @@
 #
 # ── PLANES: THIS IS A `systemd --user` UNIT, SO IT GOES WHERE USER UNITS GO ─────────────────────
 #
-# Projected by ./nixos.nix and ../home/fabric-sync.nix, and NOT by ../system-manager/default.nix —
-# the same split ../modules/daemon.nix's fabric-sync already follows, for a sharper reason than
+# Projected by ./nixos.nix and ../home/default.nix, and NOT by ../system-manager/default.nix —
+# the same split nixaudiod follows, for a sharper reason than
 # symmetry. system-manager can WRITE `/etc/systemd/user/*.service` (a consumer of this flake does
 # exactly that for an ordering shim), but it never reloads the user manager, so a unit it writes is
 # inert until the next login. A guard that only arms itself after the next reboot is not a guard.
@@ -257,12 +256,12 @@ in
         Null is not a safe default on NixOS and the option exists because of a reproduced incident:
         NixOS's `systemd.user.services` installs a unit into EVERY user's systemd manager, not just
         the intended one. A `machinectl shell` root login once started a second copy of this
-        repo's fabric-sync with no pipewire-pulse to talk to, which then `Restart=always`-looped for
+        audio daemon with no pipewire-pulse to talk to, which then `Restart=always`-looped for
         an hour racing the healthy instance. A guard is worse in that position than a daemon: a
         stray root copy would find no graph (because root has none), conclude the session is broken,
         and start restarting a unit belonging to a session it cannot see.
 
-        Set it to the same user as `nixaudio.fabric.daemon.user` on any NixOS host. It is null
+        Set it to the same user as `nixaudio.daemon.user` on any NixOS host. It is null
         rather than derived from that option because the guard does not require the fabric, and
         `daemon.user` has no default to fall back to.
 
@@ -415,5 +414,5 @@ in
   # No `config` section, deliberately — same reason ./daemon.nix has none. This file defines a
   # package and its settings and nothing that assumes a plane's option surface, which is what makes
   # it importable into a home-manager module tree as readily as a NixOS one. The two projections
-  # live in ./nixos.nix and ../home/fabric-sync.nix.
+  # live in ./nixos.nix and ../home/default.nix.
 }

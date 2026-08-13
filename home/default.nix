@@ -28,14 +28,14 @@ let
   cfg = config.nixaudio;
 
   # Under home-manager everything is user-scoped, so the daemon's config lives in the user's own
-  # XDG config dir rather than /etc. The daemon reads NIXAUDIO_FABRIC_CONFIG, so nothing about it
+  # XDG config dir rather than /etc. The daemon reads NIXAUDIO_CONFIG, so nothing about it
   # needs to know which plane placed the file.
-  configRelPath = "nixaudio/fabric.json";
+  configRelPath = "nixaudio/config.json";
   configAbsPath = "${config.xdg.configHome}/${configRelPath}";
   daemonConfigPath =
-    if cfg.fabric.daemon.externalConfigPath == null
+    if cfg.daemon.externalConfigPath == null
     then configAbsPath
-    else cfg.fabric.daemon.externalConfigPath;
+    else cfg.daemon.externalConfigPath;
 in
 {
   imports = [
@@ -47,10 +47,10 @@ in
     ../modules/guard.nix
   ];
 
-  options.nixaudio.fabric.daemon.externalConfigPath = lib.mkOption {
+  options.nixaudio.daemon.externalConfigPath = lib.mkOption {
     type = lib.types.nullOr lib.types.str;
     default = null;
-    example = "/etc/nixaudio/fabric.json";
+    example = "/etc/nixaudio/config.json";
     description = ''
       Existing daemon configuration to use instead of generating a second Home Manager copy.
 
@@ -144,15 +144,17 @@ in
     # The service is intentionally gated on daemon.enable rather than fabric.enable. With an
     # external config, Home Manager does not need to duplicate the host's listener or peer facts at
     # all; it owns only the user-service lifecycle while system-manager owns /etc.
-    (lib.mkIf cfg.fabric.daemon.enable {
-      xdg.configFile = lib.optionalAttrs (cfg.fabric.daemon.externalConfigPath == null) {
-        ${configRelPath}.source = cfg.fabric.daemon.configFile;
+    (lib.mkIf cfg.daemon.enable {
+      home.packages = [ cfg.daemon.package ];
+
+      xdg.configFile = lib.optionalAttrs (cfg.daemon.externalConfigPath == null) {
+        ${configRelPath}.source = cfg.daemon.configFile;
       };
 
       systemd.user.services = {
-        fabric-sync = {
+        nixaudiod = {
           Unit = {
-            Description = "Audio fabric device mirror (nixaudio)";
+            Description = "nixaudio PipeWire control plane";
             # Wants rather than Requires: pipewire-pulse is socket-activated, and the daemon's own
             # self-heal path handles a pulse that disappears later. A hard Requires would drag the
             # daemon down with it and defeat that recovery.
@@ -161,8 +163,8 @@ in
           };
 
           Service = {
-            Environment = [ "NIXAUDIO_FABRIC_CONFIG=${daemonConfigPath}" ];
-            ExecStart = "${cfg.fabric.daemon.package}/bin/fabric-sync";
+            Environment = [ "NIXAUDIO_CONFIG=${daemonConfigPath}" "PATH=/usr/bin" ];
+            ExecStart = "${cfg.daemon.package}/bin/nixaudiod";
             Restart = "always";
             RestartSec = 5;
           };
@@ -171,6 +173,24 @@ in
           # a headless node with lingering enabled must still join the fabric with no session at all.
           Install.WantedBy = [ "default.target" ];
         };
+      };
+    })
+
+    (lib.mkIf cfg.tray.enable {
+      home.packages = [ cfg.tray.package ];
+      systemd.user.services.nixaudio-tray = {
+        Unit = {
+          Description = "nixaudio StatusNotifier frontend";
+          After = [ "nixaudiod.service" ];
+          Wants = [ "nixaudiod.service" ];
+          PartOf = [ "graphical-session.target" ];
+        };
+        Service = {
+          ExecStart = "${cfg.tray.package}/bin/nixaudio-tray";
+          Restart = "on-failure";
+          RestartSec = 2;
+        };
+        Install.WantedBy = [ "graphical-session.target" ];
       };
     })
   ];

@@ -80,10 +80,10 @@ let
     ] ++ modules;
   };
 
-  # A NixOS fabric daemon has to name its user. Keep that ordinary valid default in all the broad
+  # A NixOS runtime daemon has to name its user. Keep that ordinary valid default in all the broad
   # fixtures, and exercise the rejected missing-user shape separately below.
   eval = modules: evalPlane nixaudioModule ([
-    { nixaudio.fabric.daemon.user = lib.mkDefault "test-user"; }
+    { nixaudio.daemon.user = lib.mkDefault "test-user"; }
   ] ++ modules);
   evalWithoutDaemonUser = evalPlane nixaudioModule;
 
@@ -109,6 +109,7 @@ let
   homeStub = { lib, ... }: {
     options.xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
     options.xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
+    options.home.packages = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
     options.systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
     options.systemd.user.timers = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; };
     options.assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
@@ -117,7 +118,7 @@ let
 
   evalHome = modules: lib.evalModules {
     specialArgs = { inherit pkgs; };
-    modules = [ ../home/fabric-sync.nix homeStub ] ++ modules;
+    modules = [ ../home/default.nix homeStub ] ++ modules;
   };
 
   failed = c: builtins.filter (a: !a.assertion) c.config.assertions;
@@ -278,8 +279,8 @@ let
   # config. Home Manager knows no listener or peers at all; it only points the service at /etc.
   homeExternalDaemon = evalHome [
     {
-      nixaudio.fabric.daemon.enable = true;
-      nixaudio.fabric.daemon.externalConfigPath = "/etc/nixaudio/fabric.json";
+      nixaudio.daemon.enable = true;
+      nixaudio.daemon.externalConfigPath = "/etc/nixaudio/config.json";
       nixaudio.dropIns = "system";
     }
   ];
@@ -420,10 +421,11 @@ let
   homePlane = evalHome [
     {
       nixaudio.fabric.enable = true;
+      nixaudio.tray.enable = true;
       nixaudio.fabric.listen.address = "203.0.113.14";
       nixaudio.fabric.peers.host-a.host = "host-a";
       # A device declared right on the home-manager plane -- proves catalogue.nix's import into
-      # home/fabric-sync.nix actually reaches this plane rather than only the two NixOS-side ones.
+      # home/default.nix actually reaches this plane rather than only the two NixOS-side ones.
       nixaudio.devices.dock-mic.match."device.name" = "alsa_card.usb-dock";
     }
   ];
@@ -698,11 +700,11 @@ let
     # every host that ran it, so asserting on rendered text would only prove the text exists.
     {
       name = "mirrored peer devices are deprioritised, via the daemon's tunnel properties";
-      ok = composed.config.nixaudio.fabric.daemon.settings.mirrorPriority == 0;
+      ok = composed.config.nixaudio.daemon.settings.mirrorPriority == 0;
     }
     {
       name = "the daemon is told the listen address, so the probe can assert a real socket";
-      ok = composed.config.nixaudio.fabric.daemon.settings.listen == "203.0.113.14";
+      ok = composed.config.nixaudio.daemon.settings.listen == "203.0.113.14";
     }
 
     # ── The carrier: the ONE mechanism that makes node-level rules possible at all ─────────────
@@ -830,7 +832,7 @@ let
     }
     {
       name = "the home plane still places the daemon's OWN config, which is not a drop-in";
-      ok = homeSystemDropIns.config.xdg.configFile ? "nixaudio/fabric.json";
+      ok = homeSystemDropIns.config.xdg.configFile ? "nixaudio/config.json";
     }
     {
       name = "the system-manager plane places no drop-in when the user plane owns them";
@@ -838,7 +840,7 @@ let
     }
     {
       name = "the system-manager plane owns the generated daemon config";
-      ok = archPlane.config.environment.etc ? "nixaudio/fabric.json";
+      ok = archPlane.config.environment.etc ? "nixaudio/config.json";
     }
     {
       name = "evaluates with neither nixusb nor nixnet composed";
@@ -861,19 +863,19 @@ let
       # table is host -> name because that is what it dials. The inversion has to actually happen.
       name = "the daemon's peer table is inverted from the option surface";
       ok =
-        let conf = composed.config.nixaudio.fabric.daemon.settings;
+        let conf = composed.config.nixaudio.daemon.settings;
         in conf.peers ? "host-a" && conf.peers."host-a" == "host-a";
     }
     {
       name = "the daemon config carries the configured port and loop";
       ok =
-        let conf = composed.config.nixaudio.fabric.daemon.settings;
-        in conf.port == 4713 && conf.loop == "fabric-loop.0";
+        let conf = composed.config.nixaudio.daemon.settings;
+        in conf.port == 4713 && conf.loopName == "fabric-loop.0";
     }
     {
       name = "the daemon runs as a user service, not a system one";
       # The audio graph belongs to a user session; there is no system-wide PipeWire to attach to.
-      ok = composed.config.systemd.user.services ? fabric-sync;
+      ok = composed.config.systemd.user.services ? nixaudiod;
     }
     {
       name = "a NixOS daemon without an owner is REJECTED";
@@ -886,7 +888,7 @@ let
     }
     {
       name = "the NixOS daemon and guard are fenced to the declared user";
-      ok = composed.config.systemd.user.services.fabric-sync.unitConfig.ConditionUser == "test-user"
+      ok = composed.config.systemd.user.services.nixaudiod.unitConfig.ConditionUser == "test-user"
         && composed.config.systemd.user.services.nixaudio-alsa-guard.unitConfig.ConditionUser == "test-user";
     }
     {
@@ -962,7 +964,7 @@ let
     {
       name = "the home-manager plane also computes the catalogue, from its own local devices";
       # Proves catalogue.nix's import reaches the home-manager plane too, not only the two
-      # NixOS-side ones (modules/default.nix, system-manager/default.nix) -- see home/fabric-sync.nix.
+      # NixOS-side ones (modules/default.nix, system-manager/default.nix) -- see home/default.nix.
       ok = ((catalogue homePlane)."dock-mic" or { }).origin or null == "local";
     }
     {
@@ -996,29 +998,37 @@ let
       ok =
         let c = homePlane.config;
         in (c.xdg.configFile ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf")
-          && (c.xdg.configFile ? "nixaudio/fabric.json")
-          && (c.systemd.user.services ? fabric-sync);
+          && (c.xdg.configFile ? "nixaudio/config.json")
+          && (c.systemd.user.services ? nixaudiod);
     }
     {
       name = "the home-manager unit uses home-manager's capitalised shape";
       # NixOS's flat description/serviceConfig shape would silently produce a broken unit here.
       ok =
-        let u = homePlane.config.systemd.user.services.fabric-sync;
+        let u = homePlane.config.systemd.user.services.nixaudiod;
         in (u ? Unit) && (u ? Service) && (u ? Install) && !(u ? serviceConfig);
+    }
+    {
+      name = "the tray is a separate user service and follows the graphical session";
+      ok =
+        let u = homePlane.config.systemd.user.services.nixaudio-tray;
+        in (homePlane.config.systemd.user.services ? nixaudio-tray)
+          && u.Install.WantedBy == [ "graphical-session.target" ]
+          && u.Unit.Wants == [ "nixaudiod.service" ];
     }
     {
       name = "the home plane points the daemon at the user's own config path";
       ok = builtins.any
-        (e: lib.hasInfix "NIXAUDIO_FABRIC_CONFIG=/home/test/.config/nixaudio/fabric.json" e)
-        homePlane.config.systemd.user.services.fabric-sync.Service.Environment;
+        (e: lib.hasInfix "NIXAUDIO_CONFIG=/home/test/.config/nixaudio/config.json" e)
+        homePlane.config.systemd.user.services.nixaudiod.Service.Environment;
     }
     {
       name = "the home plane can run only the daemon against system-manager's config";
-      ok = (homeExternalDaemon.config.systemd.user.services ? fabric-sync)
-        && !(homeExternalDaemon.config.xdg.configFile ? "nixaudio/fabric.json")
+      ok = (homeExternalDaemon.config.systemd.user.services ? nixaudiod)
+        && !(homeExternalDaemon.config.xdg.configFile ? "nixaudio/config.json")
         && builtins.any
-        (e: e == "NIXAUDIO_FABRIC_CONFIG=/etc/nixaudio/fabric.json")
-        homeExternalDaemon.config.systemd.user.services.fabric-sync.Service.Environment;
+        (e: e == "NIXAUDIO_CONFIG=/etc/nixaudio/config.json")
+        homeExternalDaemon.config.systemd.user.services.nixaudiod.Service.Environment;
     }
 
     # ── The backend: the universal set ────────────────────────────────────────────────────────
@@ -1262,24 +1272,9 @@ let
   failures = builtins.filter (e: !e.ok) expectations;
 in
 {
-  # The one check here that is not a pure evaluation, and cannot be. "Does a RUNNING daemon notice
-  # that its config changed" is a runtime property by definition -- no amount of evaluating options
-  # can observe it, because the defect lives entirely in the gap between what the generated file
-  # says and what a long-lived process still holds in memory. So this check actually executes the
-  # daemon's discovery entry point against a config file that is rewritten underneath it. See
-  # ./daemon-peer-reload.py's own header for the production failure it reproduces.
-  daemon = pkgs.runCommand "nixaudio-daemon-checks"
-    {
-      nativeBuildInputs = [ pkgs.python3 pkgs.iproute2 ];
-      # The fixture stands up a real loopback listener so the daemon's reachability probe runs for
-      # real rather than being stubbed -- a stubbed probe could pass while the probe itself is what
-      # is broken.
-      FABRIC_SYNC = ../daemon/fabric-sync;
-    } ''
-    cd "$(mktemp -d)"
-    python3 ${./daemon-peer-reload.py}
-    touch $out
-  '';
+  # buildRustPackage runs the Rust unit tests and builds every runtime binary. Keeping it as a flake
+  # check makes the public package and the checked implementation exactly the same derivation.
+  daemon = import ../package.nix { inherit pkgs; };
 
   purity = pkgs.runCommand "nixaudio-purity-checks" { } ''
     ${lib.optionalString (failures != [ ]) ''

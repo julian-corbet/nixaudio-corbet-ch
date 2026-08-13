@@ -53,7 +53,7 @@ in
     # declared audio and no device pool loses its cards to the same D-Bus timeout. The guard UNIT is
     # deliberately absent from this plane -- system-manager never reloads the user manager, so a
     # `systemd --user` unit written here would stay inert until the next login. That half belongs to
-    # the home-manager plane (../home/fabric-sync.nix), which is why nixaudio's own docs call that
+    # the home-manager plane (../home/default.nix), which is why nixaudio's own docs call that
     # plane non-optional on a system-manager host.
     (lib.mkIf (cfg.dropIns == "system" && cfg.guard.wireplumberConfig != "") {
       environment.etc."wireplumber/wireplumber.conf.d/50-nixaudio-reservation.conf".text =
@@ -94,8 +94,8 @@ in
     # system-manager owns the host-level fabric facts on Arch: the listener address and peer table
     # are already declared in this tree, so serialise them once into /etc. Home Manager can then run
     # the user service against this file without repeating either value in its separate evaluation.
-    (lib.mkIf (cfg.fabric.enable && cfg.fabric.daemon.enable) {
-      environment.etc."nixaudio/fabric.json".source = cfg.fabric.daemon.configFile;
+    (lib.mkIf cfg.daemon.enable {
+      environment.etc."nixaudio/config.json".source = cfg.daemon.configFile;
     })
   ];
 }
