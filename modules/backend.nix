@@ -1,14 +1,7 @@
 # nixaudio.backend — the packages the rest of this module's output is written against.
 #
-# THE GAP THIS CLOSES. Until this file, nixaudio declared ZERO packages. It renamed devices it did
-# not install a session manager to enumerate, and hung a TCP listener off a pulse layer it never
-# asked anyone to install. On a NixOS host that was survivable by accident -- ../modules/nixos.nix
-# reaches for `services.pipewire.*`, so the daemons arrive with the policy. On a host whose distro
-# is not NixOS it was not: the system-manager plane wrote config fragments into /etc and assumed
-# somebody had once run the right `pacman -S` by hand. That assumption is exactly the class of
-# undeclared fact this family exists to eliminate, and it had already produced a real defect -- one
-# host with no `alsa-utils` at all, i.e. no way to inspect or clear a hardware mute, on a machine
-# whose audio this module claims to own.
+# The backend is PipeWire plus its native compatibility layers. JackTrip is not the graph: its JACK
+# ports enter that graph through pipewire-jack, while Pulse remains only for ordinary applications.
 #
 # ── PLANE-NEUTRAL: THIS FILE INSTALLS NOTHING ───────────────────────────────────────────────────
 #
@@ -31,13 +24,7 @@
 #
 # ── WHY `enable` FOLLOWS `fabric.enable` ────────────────────────────────────────────────────────
 #
-# Not a convenience default. The fabric's listener is a module loaded INTO pipewire-pulse, its
-# device names are WirePlumber rules, and its daemon talks to the graph through the pulse layer --
-# a host running the fabric without this backend is not a host with less audio, it is a host with a
-# config file for a daemon that does not exist. So the backend defaults on wherever the fabric is
-# on, and turning it off there is an assertion failure rather than a supported configuration. The
-# reverse is a legitimate and expected shape: a host that wants its audio backend declared without
-# joining any device pool sets `backend.enable = true` and leaves `fabric.enable` alone.
+# The fabric cannot exist without a local graph, so enabling it also enables this backend.
 { lib, config, ... }:
 let
   cfg = config.nixaudio.backend;
@@ -81,10 +68,9 @@ in
         compatibility layers every client actually speaks, and the diagnostic tools for when none of
         that produces sound -- is nixaudio's to declare.
 
-        Defaults to `nixaudio.fabric.enable`, because the fabric is written against this backend
-        and cannot function without it: its listener is a module loaded into pipewire-pulse, and its
-        device names are WirePlumber rules. Enabling it WITHOUT the fabric is a supported and
-        expected shape -- a host that wants declared audio and no device pool.
+        Defaults to `nixaudio.fabric.enable`, because the fabric routes through PipeWire and runs
+        JackTrip through PipeWire's JACK compatibility layer. Enabling it without the fabric is a
+        supported local-only audio configuration.
 
         This installs nothing by itself. See this module's header for what each plane does with it.
       '';
@@ -261,11 +247,7 @@ in
       {
         assertion = config.nixaudio.fabric.enable -> cfg.enable;
         message = ''
-          nixaudio: `fabric.enable` is on while `backend.enable` is off. The fabric is written
-          against the backend and cannot work without it -- its listener is a module loaded into
-          pipewire-pulse, its device names are WirePlumber rules, and its daemon reaches the graph
-          through the pulse layer. What that combination produces is not reduced functionality but
-          rendered config files for daemons nothing installed.
+          nixaudio: `fabric.enable` requires the PipeWire backend and its JACK compatibility layer.
         '';
       }
     ];

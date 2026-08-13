@@ -109,15 +109,15 @@ in
     })
 
     (lib.mkIf cfg.fabric.enable {
+      nixaudio.fabric.transport.command = [
+        "${pkgs.pipewire.jack}/bin/pw-jack"
+        "${cfg.fabric.transport.package}/bin/jacktrip"
+      ];
+
       services.pipewire = {
         enable = lib.mkDefault true;
         alsa.enable = lib.mkDefault true;
-        # pipewire-pulse is not optional for this module: it hosts the listener peers connect to and
-        # is what `pactl` (and therefore the mirroring daemon) talks to.
-        pulse.enable = true;
-
-        extraConfig.pipewire = cfg.fabric.pipewireConfig;
-        extraConfig.pipewire-pulse = cfg.fabric.pulseConfig;
+        jack.enable = true;
       };
 
       # WirePlumber rules go through /etc rather than services.pipewire.wireplumber.configPackages so
@@ -130,14 +130,14 @@ in
     })
 
     (lib.mkIf cfg.daemon.enable {
-      environment.systemPackages = [ cfg.daemon.package ];
+      environment.systemPackages = [ cfg.daemon.package cfg.fabric.transport.package ];
       environment.etc."nixaudio/config.json".source = cfg.daemon.configFile;
       systemd.user.services.nixaudiod = {
         description = "nixaudio PipeWire control plane";
-        after = [ "pipewire-pulse.service" ];
-        wants = [ "pipewire-pulse.service" ];
+        after = [ "pipewire.service" "wireplumber.service" ];
+        wants = [ "pipewire.service" "wireplumber.service" ];
         wantedBy = [ "default.target" ];
-        path = [ pkgs.coreutils pkgs.pipewire pkgs.pulseaudio ];
+        path = [ pkgs.coreutils pkgs.pipewire ];
         environment.NIXAUDIO_CONFIG = "/etc/nixaudio/config.json";
         unitConfig = lib.optionalAttrs (cfg.daemon.user != null) { ConditionUser = cfg.daemon.user; };
         serviceConfig = {

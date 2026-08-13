@@ -7,6 +7,7 @@ use ksni::{
 use nixaudio::{
     api::AudioProxy,
     graph::{Endpoint, Snapshot, Stream},
+    API_VERSION,
 };
 use std::{collections::BTreeSet, sync::Arc};
 use tokio::{
@@ -50,13 +51,12 @@ impl AudioTray {
             .and_then(|id| snapshot.outputs.iter().find(|v| &v.id == id))
     }
 
-    fn volume_actions(endpoint: &Endpoint) -> Vec<MenuItem<Self>> {
-        let lower_id = endpoint.id.clone();
-        let lower = (endpoint.volume - 0.05).max(0.0);
-        let raise_id = endpoint.id.clone();
-        let raise = (endpoint.volume + 0.05).min(1.5);
-        let mute_id = endpoint.id.clone();
-        let muted = endpoint.muted;
+    fn volume_actions(object: &str, volume: f64, muted: bool) -> Vec<MenuItem<Self>> {
+        let lower_id = object.to_owned();
+        let lower = (volume - 0.05).max(0.0);
+        let raise_id = object.to_owned();
+        let raise = (volume + 0.05).min(1.5);
+        let mute_id = object.to_owned();
         vec![
             StandardItem {
                 label: "Volume -5%".into(),
@@ -104,6 +104,7 @@ impl AudioTray {
                 CheckmarkItem {
                     label: format!("{}  —  {}", endpoint.id, endpoint.label),
                     checked: snapshot.default_output.as_deref() == Some(endpoint.id.as_str()),
+                    enabled: endpoint.available,
                     activate: Box::new(move |this: &mut Self| {
                         let _ = this.actions.send(Action::DefaultOutput(id.clone()));
                     }),
@@ -130,6 +131,7 @@ impl AudioTray {
                 CheckmarkItem {
                     label: format!("{}  —  {}", endpoint.id, endpoint.label),
                     checked: snapshot.default_input.as_deref() == Some(endpoint.id.as_str()),
+                    enabled: endpoint.available,
                     activate: Box::new(move |this: &mut Self| {
                         let _ = this.actions.send(Action::DefaultInput(id.clone()));
                     }),
@@ -170,6 +172,12 @@ impl AudioTray {
                 .into()
             })
             .collect();
+        items.push(MenuItem::Separator);
+        items.extend(Self::volume_actions(
+            &stream.id,
+            stream.volume,
+            stream.muted,
+        ));
         let clear = stream.id.clone();
         items.push(MenuItem::Separator);
         items.push(
@@ -217,6 +225,9 @@ impl Tray for AudioTray {
         let Some(output) = self.default_output() else {
             return "audio-volume-muted".into();
         };
+        if output.location != "local" {
+            return "audio-speakers".into();
+        }
         if output.muted || output.volume == 0.0 {
             "audio-volume-muted"
         } else if output.volume < 0.34 {
@@ -264,7 +275,10 @@ impl Tray for AudioTray {
         }
     }
     fn scroll(&mut self, delta: i32, _orientation: ksni::Orientation) {
-        if let Some(output) = self.default_output() {
+        if let Some(output) = self
+            .default_output()
+            .filter(|output| output.location == "local")
+        {
             let value = (output.volume + if delta > 0 { 0.05 } else { -0.05 }).clamp(0.0, 1.5);
             let _ = self.actions.send(Action::Volume {
                 object: output.id.clone(),
@@ -295,11 +309,14 @@ impl Tray for AudioTray {
             self.output_menu(snapshot),
             self.input_menu(snapshot),
         ];
-        if let Some(output) = self.default_output() {
+        if let Some(output) = self
+            .default_output()
+            .filter(|output| output.location == "local")
+        {
             menu.push(
                 SubMenu {
                     label: format!("Output volume · {}%", (output.volume * 100.0).round()),
-                    submenu: Self::volume_actions(output),
+                    submenu: Self::volume_actions(&output.id, output.volume, output.muted),
                     ..Default::default()
                 }
                 .into(),
@@ -389,7 +406,7 @@ async fn run_backend(
             }
         };
         let proxy = match AudioProxy::new(&connection).await {
-            Ok(proxy) if proxy.api_version().await == Ok(1) => proxy,
+            Ok(proxy) if proxy.api_version().await == Ok(API_VERSION) => proxy,
             Ok(_) => {
                 let _ = handle
                     .update(|tray| {

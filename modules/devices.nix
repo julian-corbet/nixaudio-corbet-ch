@@ -66,9 +66,8 @@
 # small overlay, keyed by the same stable NAME `fromUsb`/`explicitDevices` already assign, applied
 # after device identity is resolved rather than folded into how identity is declared.
 #
-# THIS IS A TIE-BREAKER, NOT A ROUTE PIN. `modules/fabric.nix`'s header ("ROUTING INTENT IS STATE,
-# NOT CONFIGURATION") draws this line for the fabric's own default-priority knob and it applies here
-# unmodified: this only ever affects an UNOPINIONATED app willing to accept whatever PipeWire
+# THIS IS A TIE-BREAKER, NOT A ROUTE PIN. This only ever affects an UNOPINIONATED app willing to
+# accept whatever PipeWire
 # currently calls the default. The moment an app pins a sink explicitly, or a human moves the
 # default with `wpctl set-default`/`pw-link`, that live choice wins exactly as it would with no
 # priority declared at all — a rebuild does not, and must not, reach into the running graph and force
@@ -82,12 +81,8 @@
 # are two independently-settable fields, never one.
 #
 # NUMBER SPACE: positive integers only (`>= 1`), no declared ceiling.
-#   - Zero and below are refused by the option's own type, on purpose. `modules/fabric.nix`'s
-#     `mirrorPriority` stamps `priority.session = 0` onto every mirrored fabric node so real
-#     hardware always wins the default-node race against a tunnel (see that module's header). A
-#     locally-declared priority of 0 would tie a piece of REAL hardware with a DEPRIORITISED MIRROR —
-#     the exact failure that scheme exists to prevent — so this option cannot express it at all,
-#     rather than relying on every caller to remember not to.
+#   - Zero and below are refused by the option's own type: a usable local endpoint needs a positive
+#     WirePlumber session priority.
 #   - No ceiling is declared because PipeWire's own ALSA-monitor-assigned `priority.session` for real
 #     hardware is not a fixed, documented range: verified live across this fleet's own devices it
 #     spans at least 664 (an HDMI output nobody wants first) to 2100 (a muted fallback microphone),
@@ -103,7 +98,7 @@
 let
   cfg = config.nixaudio;
 
-  # Defensive read — the idiom nixhost already uses for nixnet.interfaces. nixusb is a soft
+  # Defensive read: nixusb is a soft
   # dependency: if it is absent, `or { }` keeps evaluation working instead of exploding.
   usbDevices = config.nixusb.devices or { };
 
@@ -379,8 +374,8 @@ in
             type = lib.types.str;
             default = "";
             description = ''
-              Human-readable description shown in mixers and, crucially, in the tunnel descriptions
-              peers see when this device is mirrored across the fabric. Defaults to the attribute name.
+              Human-readable description shown locally and in the live endpoint manifest peers
+              receive. Defaults to the attribute name.
             '';
           };
 
@@ -435,8 +430,7 @@ in
 
         It stays TRUE by default anyway, because that is what this module already promises
         everywhere else: `nixaudio.priorities` is documented as a tie-breaker for an unopinionated
-        app, and `modules/fabric.nix`'s "ROUTING INTENT IS STATE, NOT CONFIGURATION" says the live
-        choice wins. A human who moved their default output is the clearest possible expression of
+        app, and the live choice wins. A human who moved their default output is the clearest possible expression of
         exactly that. Turning this off makes declared priority authoritative instead, at the price
         of a `wpctl set-default` no longer surviving a logout — which is a real preference about how
         the machine should behave, not a defect, so it is a switch and not a default.
@@ -463,15 +457,12 @@ in
               all four is not a tie-break, it is the loss of a ranking that already worked.
 
               A tie-breaker for an unopinionated app's default-sink pick, never a route: see this
-              file's header, and `modules/fabric.nix`'s "ROUTING INTENT IS STATE, NOT CONFIGURATION"
-              — the moment any app or a human pins a sink explicitly, that live choice wins over
+              file's header: the moment any app or a human pins a sink explicitly, that live choice wins over
               this regardless of the number here. Note that a human's pin is REMEMBERED across
               sessions by WirePlumber's own state file, and a remembered pin outranks any number
               declared here; `restoreDefaultTargets` is where that interaction is described.
 
-              Must be a positive integer (`>= 1`); the type itself refuses 0 and below, because 0 is
-              what `modules/fabric.nix`'s `mirrorPriority` stamps onto a deprioritised mirror,
-              and a local device tied with that would defeat the whole point of that scheme.
+              Must be a positive integer (`>= 1`).
             '';
           };
 

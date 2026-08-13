@@ -1,4 +1,9 @@
-use crate::{config::Config, state::State, API_VERSION};
+use crate::{
+    config::Config,
+    fabric::{EndpointManifest, Manifest, Snapshot as FabricSnapshot},
+    state::State,
+    API_VERSION,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,8 +42,8 @@ pub struct Endpoint {
     pub available: bool,
     pub volume: f64,
     pub muted: bool,
-    pub pipewire_id: u32,
-    pub pipewire_name: String,
+    pub pipewire_id: Option<u32>,
+    pub pipewire_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,8 +86,6 @@ struct Node {
     media_role: String,
     carrier: Option<String>,
     profile: Option<String>,
-    peer: Option<String>,
-    remote_device: Option<String>,
     volume: f64,
     muted: bool,
 }
@@ -91,6 +94,7 @@ struct Node {
 struct Port {
     id: u32,
     node: u32,
+    name: String,
     direction: String,
     channel: String,
 }
@@ -99,7 +103,6 @@ struct Port {
 struct Link {
     output_node: u32,
     output_port: u32,
-    input_node: u32,
     input_port: u32,
 }
 
@@ -108,11 +111,14 @@ pub struct Graph {
     pub snapshot: Snapshot,
     stream_nodes: HashMap<String, u32>,
     endpoint_nodes: HashMap<String, u32>,
+    endpoint_ports: HashMap<String, Vec<u32>>,
     stream_intents: HashMap<String, String>,
     ports: Vec<Port>,
     links: Vec<Link>,
     actual_default_output: Option<String>,
     actual_default_input: Option<String>,
+    fabric: FabricSnapshot,
+    node_names: HashMap<String, u32>,
 }
 
 fn text(props: &Value, key: &str) -> String {
@@ -165,45 +171,7 @@ fn safe(value: &str) -> String {
     out.trim_matches('_').to_lowercase()
 }
 
-fn tunnel_identity(node: &Node, config: &Config) -> Option<(String, String)> {
-    if let (Some(peer), Some(device)) = (&node.peer, &node.remote_device) {
-        return Some((peer.clone(), device.clone()));
-    }
-    let rest = node.description.strip_prefix("Tunnel to tcp:")?;
-    let (server, device) = rest.split_once('/')?;
-    let address = server.rsplit_once(':').map(|v| v.0).unwrap_or(server);
-    let peer = config
-        .peers
-        .get(address)
-        .cloned()
-        .unwrap_or_else(|| address.to_owned());
-    Some((peer, device.to_owned()))
-}
-
-fn endpoint_identity(node: &Node, config: &Config) -> (String, String, String) {
-    if let Some((peer, raw_device)) = tunnel_identity(node, config) {
-        let declared = config.catalogue.values().find(|entry| {
-            entry.peer.as_deref() == Some(peer.as_str()) && entry.device == raw_device
-        });
-        let device = declared
-            .map(|v| v.device.clone())
-            .unwrap_or_else(|| safe(&raw_device));
-        let label = declared
-            .and_then(|v| v.description.clone())
-            .or_else(|| {
-                config
-                    .catalogue
-                    .values()
-                    .find(|entry| entry.origin == "local" && entry.device == device)
-                    .and_then(|entry| entry.description.clone())
-            })
-            .unwrap_or_else(|| node.description.clone());
-        return (
-            format!("{}.{}", safe(&peer), safe(&device)),
-            device,
-            format!("{} · {}", peer, label),
-        );
-    }
+fn endpoint_identity(node: &Node) -> (String, String, String) {
     let device = node.carrier.clone().unwrap_or_else(|| safe(&node.name));
     let suffix = node
         .profile
@@ -217,8 +185,25 @@ fn endpoint_identity(node: &Node, config: &Config) -> (String, String, String) {
     (id, device, node.description.clone())
 }
 
+fn numbered_port(name: &str, prefix: &str) -> Option<usize> {
+    name.strip_prefix(prefix)?.parse().ok()
+}
+
+fn remote_id(peer: &str, local_id: &str) -> String {
+    format!(
+        "{}.{}",
+        safe(peer),
+        local_id.strip_prefix("local.").unwrap_or(local_id)
+    )
+}
+
 impl Graph {
-    pub fn inspect(config: &Config, state: &State, revision: u64) -> Result<Self> {
+    pub fn inspect(
+        config: &Config,
+        state: &State,
+        fabric: &FabricSnapshot,
+        revision: u64,
+    ) -> Result<Self> {
         let output = Command::new("timeout")
             .args(["--kill-after=1s", "6s", "pw-dump"])
             .output()
@@ -231,13 +216,14 @@ impl Graph {
         }
         let values: Vec<Value> =
             serde_json::from_slice(&output.stdout).context("parse pw-dump output")?;
-        Self::from_values(&values, config, state, revision)
+        Self::from_values(&values, config, state, fabric, revision)
     }
 
     pub fn from_values(
         values: &[Value],
         config: &Config,
         state: &State,
+        fabric: &FabricSnapshot,
         revision: u64,
     ) -> Result<Self> {
         let mut nodes = HashMap::new();
@@ -263,29 +249,29 @@ impl Graph {
                             serial: integer(props, "object.serial"),
                             name: text(props, "node.name"),
                             description: {
-                                let v = text(props, "node.description");
-                                if v.is_empty() {
+                                let value = text(props, "node.description");
+                                if value.is_empty() {
                                     text(props, "node.name")
                                 } else {
-                                    v
+                                    value
                                 }
                             },
                             media_name: text(props, "media.name"),
                             media_class: text(props, "media.class"),
                             application: {
-                                let v = text(props, "application.name");
-                                if v.is_empty() {
+                                let value = text(props, "application.name");
+                                if value.is_empty() {
                                     text(props, "application.process.binary")
                                 } else {
-                                    v
+                                    value
                                 }
                             },
                             application_id: {
-                                let v = text(props, "application.id");
-                                if v.is_empty() {
+                                let value = text(props, "application.id");
+                                if value.is_empty() {
                                     text(props, "application.process.binary")
                                 } else {
-                                    v
+                                    value
                                 }
                             },
                             media_role: text(props, "media.role"),
@@ -297,14 +283,6 @@ impl Graph {
                                 .get("device.profile.name")
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned),
-                            peer: props
-                                .get("nixaudio.peer")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                            remote_device: props
-                                .get("nixaudio.device")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
                             volume,
                             muted,
                         },
@@ -313,6 +291,7 @@ impl Graph {
                 "PipeWire:Interface:Port" => ports.push(Port {
                     id,
                     node: integer(props, "node.id") as u32,
+                    name: text(props, "port.name"),
                     direction: text(props, "port.direction"),
                     channel: text(props, "audio.channel"),
                 }),
@@ -323,10 +302,6 @@ impl Graph {
                         .unwrap_or_default() as u32,
                     output_port: info
                         .get("output-port-id")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default() as u32,
-                    input_node: info
-                        .get("input-node-id")
                         .and_then(Value::as_u64)
                         .unwrap_or_default() as u32,
                     input_port: info
@@ -358,28 +333,37 @@ impl Graph {
         let mut outputs = Vec::new();
         let mut inputs = Vec::new();
         let mut endpoint_nodes = HashMap::new();
+        let mut endpoint_ports = HashMap::new();
         let mut node_endpoints = HashMap::new();
         for node in nodes
             .values()
-            .filter(|n| matches!(n.media_class.as_str(), "Audio/Sink" | "Audio/Source"))
+            .filter(|node| matches!(node.media_class.as_str(), "Audio/Sink" | "Audio/Source"))
         {
-            let (mut id, device, label) = endpoint_identity(node, config);
+            let (mut id, device, label) = endpoint_identity(node);
             if endpoint_nodes.contains_key(&id) {
                 id = format!("{}.{}", id, node.serial);
             }
-            let location = tunnel_identity(node, config)
-                .map(|v| v.0)
-                .unwrap_or_else(|| "local".into());
+            let wanted_direction = if node.media_class == "Audio/Sink" {
+                "in"
+            } else {
+                "out"
+            };
+            let mut routable: Vec<&Port> = ports
+                .iter()
+                .filter(|port| port.node == node.id && port.direction == wanted_direction)
+                .collect();
+            routable.sort_by(|a, b| a.channel.cmp(&b.channel).then(a.id.cmp(&b.id)));
+            endpoint_ports.insert(id.clone(), routable.iter().map(|port| port.id).collect());
             let endpoint = Endpoint {
                 id: id.clone(),
                 device,
-                location,
+                location: "local".into(),
                 label,
                 available: true,
                 volume: node.volume,
                 muted: node.muted,
-                pipewire_id: node.id,
-                pipewire_name: node.name.clone(),
+                pipewire_id: Some(node.id),
+                pipewire_name: Some(node.name.clone()),
             };
             endpoint_nodes.insert(id.clone(), node.id);
             node_endpoints.insert(node.id, id);
@@ -389,20 +373,83 @@ impl Graph {
                 inputs.push(endpoint)
             }
         }
+
+        // A remote output is a channel slice on one JackTrip node, not a fake PulseAudio sink.
+        // It remains a first-class target in the nixaudio API because endpoint_ports points at the
+        // exact JackTrip send ports that cross the host boundary.
+        for (peer, remote) in &fabric.peers {
+            let jacktrip = nodes
+                .values()
+                .find(|node| node.name == remote.plan.node_name);
+            let mut send_ports: Vec<&Port> = jacktrip
+                .map(|node| {
+                    ports
+                        .iter()
+                        .filter(|port| {
+                            port.node == node.id
+                                && port.direction == "in"
+                                && numbered_port(&port.name, "send_").is_some()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            send_ports.sort_by_key(|port| numbered_port(&port.name, "send_").unwrap_or(usize::MAX));
+            for slice in &remote.plan.send {
+                let Some(manifest) = remote
+                    .manifest
+                    .outputs
+                    .iter()
+                    .find(|endpoint| endpoint.id == slice.endpoint)
+                else {
+                    continue;
+                };
+                let first = slice.first - 1;
+                let last = first + slice.channels.len();
+                let target_ports = send_ports
+                    .get(first..last)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|port| port.id)
+                    .collect::<Vec<_>>();
+                let id = remote_id(peer, &manifest.id);
+                endpoint_ports.insert(id.clone(), target_ports.clone());
+                outputs.push(Endpoint {
+                    id,
+                    device: manifest
+                        .id
+                        .strip_prefix("local.")
+                        .unwrap_or(&manifest.id)
+                        .into(),
+                    location: peer.clone(),
+                    label: format!("{} · {}", peer, manifest.label),
+                    available: target_ports.len() == slice.channels.len(),
+                    volume: 1.0,
+                    muted: false,
+                    pipewire_id: jacktrip.map(|node| node.id),
+                    pipewire_name: jacktrip.map(|node| node.name.clone()),
+                });
+            }
+        }
         outputs.sort_by(|a, b| a.id.cmp(&b.id));
         inputs.sort_by(|a, b| a.id.cmp(&b.id));
 
+        let target_by_port: HashMap<u32, String> = endpoint_ports
+            .iter()
+            .flat_map(|(endpoint, ports)| {
+                ports
+                    .iter()
+                    .map(|port| (*port, endpoint.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let mut stream_nodes = HashMap::new();
         let mut stream_intents = HashMap::new();
         let mut streams = Vec::new();
         for node in nodes
             .values()
-            .filter(|n| n.media_class == "Stream/Output/Audio")
+            .filter(|node| node.media_class == "Stream/Output/Audio")
         {
-            if node.name.starts_with("nixaudio")
-                || node.name == "PipeWire"
-                || node.description.starts_with("Tunnel for ")
-            {
+            if node.name.starts_with("nixaudio") || node.name == "PipeWire" {
                 continue;
             }
             let id = format!("stream:{}", node.serial);
@@ -414,8 +461,8 @@ impl Graph {
             let intent_key = format!("{}|{}|{}", app_key, node.media_role, node.media_name);
             let targets: BTreeSet<String> = links
                 .iter()
-                .filter(|l| l.output_node == node.id)
-                .filter_map(|l| node_endpoints.get(&l.input_node).cloned())
+                .filter(|link| link.output_node == node.id)
+                .filter_map(|link| target_by_port.get(&link.input_port).cloned())
                 .collect();
             let explicit_targets = state.routes.get(&intent_key).cloned().unwrap_or_default();
             streams.push(Stream {
@@ -446,22 +493,25 @@ impl Graph {
                 .then(a.title.cmp(&b.title))
         });
 
-        let live_peers: BTreeSet<String> = outputs
-            .iter()
-            .chain(inputs.iter())
-            .filter(|v| v.location != "local")
-            .map(|v| v.location.clone())
-            .collect();
         let mut peers: Vec<Peer> = config
             .peers
             .iter()
-            .map(|(address, name)| Peer {
-                name: name.clone(),
-                address: address.clone(),
-                available: live_peers.contains(name),
+            .map(|(name, configured)| {
+                let current = fabric.peers.get(name);
+                Peer {
+                    name: name.clone(),
+                    address: current
+                        .map(|peer| peer.address.clone())
+                        .or_else(|| configured.addresses.first().cloned())
+                        .unwrap_or_default(),
+                    available: current.is_some_and(|peer| {
+                        nodes.values().any(|node| node.name == peer.plan.node_name)
+                    }),
+                }
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
+
         let mut unavailable_devices: Vec<DeclaredDevice> = config
             .catalogue
             .iter()
@@ -488,58 +538,94 @@ impl Graph {
         let missing = config
             .catalogue
             .iter()
-            .filter(|(_, v)| v.origin == "local")
+            .filter(|(_, entry)| entry.origin == "local")
             .filter(|(key, _)| {
                 !outputs
                     .iter()
                     .chain(inputs.iter())
-                    .any(|endpoint| &endpoint.device == *key)
+                    .any(|endpoint| endpoint.location == "local" && &endpoint.device == *key)
             })
             .count();
-        let health = if outputs.is_empty() && inputs.is_empty() {
-            Health {
-                status: "error".into(),
-                message: "PipeWire has no audio devices".into(),
-            }
-        } else if missing > 0 {
-            Health {
-                status: "degraded".into(),
-                message: format!("{} declared local device(s) are unavailable", missing),
-            }
-        } else {
-            Health {
-                status: "ok".into(),
-                message: format!("{} output(s), {} input(s)", outputs.len(), inputs.len()),
-            }
-        };
+        let unavailable_peers = peers.iter().filter(|peer| !peer.available).count();
+        let health =
+            if outputs.iter().all(|endpoint| endpoint.location != "local") && inputs.is_empty() {
+                Health {
+                    status: "error".into(),
+                    message: "PipeWire has no local audio devices".into(),
+                }
+            } else if missing > 0 || unavailable_peers > 0 {
+                Health {
+                    status: "degraded".into(),
+                    message: format!(
+                        "{} declared local device(s) and {} peer(s) unavailable",
+                        missing, unavailable_peers
+                    ),
+                }
+            } else {
+                Health {
+                    status: "ok".into(),
+                    message: format!(
+                        "{} output(s), {} input(s), {} peer(s)",
+                        outputs.len(),
+                        inputs.len(),
+                        peers.len()
+                    ),
+                }
+            };
+
         let actual_default_output = default_sink_name.and_then(|name| {
             outputs
                 .iter()
-                .find(|v| v.pipewire_name == name)
-                .map(|v| v.id.clone())
+                .find(|endpoint| endpoint.pipewire_name.as_deref() == Some(name.as_str()))
+                .map(|endpoint| endpoint.id.clone())
         });
         let actual_default_input = default_source_name.and_then(|name| {
             inputs
                 .iter()
-                .find(|v| v.pipewire_name == name)
-                .map(|v| v.id.clone())
+                .find(|endpoint| endpoint.pipewire_name.as_deref() == Some(name.as_str()))
+                .map(|endpoint| endpoint.id.clone())
         });
+        // Remembered intent survives an outage, but the effective default must remain usable. A
+        // remote default therefore falls back to PipeWire's local default while its peer is down
+        // and automatically wins again when the same semantic endpoint returns.
         let default_output = state
             .default_output
             .clone()
-            .or_else(|| actual_default_output.clone());
+            .filter(|wanted| {
+                outputs
+                    .iter()
+                    .any(|endpoint| endpoint.id == *wanted && endpoint.available)
+            })
+            .or_else(|| actual_default_output.clone())
+            .or_else(|| {
+                outputs
+                    .iter()
+                    .find(|endpoint| endpoint.location == "local" && endpoint.available)
+                    .map(|endpoint| endpoint.id.clone())
+            });
         let default_input = state
             .default_input
             .clone()
-            .or_else(|| actual_default_input.clone());
-        let host = hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+            .filter(|wanted| {
+                inputs
+                    .iter()
+                    .any(|endpoint| endpoint.id == *wanted && endpoint.available)
+            })
+            .or_else(|| actual_default_input.clone())
+            .or_else(|| {
+                inputs
+                    .iter()
+                    .find(|endpoint| endpoint.available)
+                    .map(|endpoint| endpoint.id.clone())
+            });
+        let node_names = nodes
+            .values()
+            .map(|node| (node.name.clone(), node.id))
+            .collect();
         let snapshot = Snapshot {
             api_version: API_VERSION,
             revision,
-            host,
+            host: config.node.clone(),
             health,
             outputs,
             inputs,
@@ -553,12 +639,94 @@ impl Graph {
             snapshot,
             stream_nodes,
             endpoint_nodes,
+            endpoint_ports,
             stream_intents,
             ports,
             links,
             actual_default_output,
             actual_default_input,
+            fabric: fabric.clone(),
+            node_names,
         })
+    }
+
+    pub fn local_manifest(&self) -> Manifest {
+        let mut manifest = Manifest {
+            protocol: 1,
+            node: self.snapshot.host.clone(),
+            revision: self.snapshot.revision,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+        };
+        for (endpoints, public) in [
+            (&self.snapshot.outputs, &mut manifest.outputs),
+            (&self.snapshot.inputs, &mut manifest.inputs),
+        ] {
+            for endpoint in endpoints
+                .iter()
+                .filter(|endpoint| endpoint.location == "local")
+            {
+                let mut endpoint_ports: Vec<&Port> = self
+                    .endpoint_ports
+                    .get(&endpoint.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| self.ports.iter().find(|port| port.id == *id))
+                    .collect();
+                endpoint_ports.sort_by(|a, b| a.channel.cmp(&b.channel).then(a.id.cmp(&b.id)));
+                if endpoint_ports.is_empty() {
+                    continue;
+                }
+                public.push(EndpointManifest {
+                    id: endpoint.id.clone(),
+                    label: endpoint.label.clone(),
+                    channels: endpoint_ports
+                        .iter()
+                        .map(|port| port.channel.clone())
+                        .collect(),
+                });
+            }
+            public.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        manifest
+    }
+
+    pub fn reconcile_transport(&self) -> Result<()> {
+        for peer in self.fabric.peers.values() {
+            let Some(node) = self.node_names.get(&peer.plan.node_name).copied() else {
+                continue;
+            };
+            let mut receive_ports: Vec<&Port> = self
+                .ports
+                .iter()
+                .filter(|port| {
+                    port.node == node
+                        && port.direction == "out"
+                        && numbered_port(&port.name, "receive_").is_some()
+                })
+                .collect();
+            receive_ports
+                .sort_by_key(|port| numbered_port(&port.name, "receive_").unwrap_or(usize::MAX));
+            for slice in &peer.plan.receive {
+                let Some(targets) = self.endpoint_ports.get(&slice.endpoint) else {
+                    continue;
+                };
+                let first = slice.first - 1;
+                for (index, target) in targets.iter().enumerate() {
+                    let Some(source) = receive_ports.get(first + index) else {
+                        continue;
+                    };
+                    if !self
+                        .links
+                        .iter()
+                        .any(|link| link.output_port == source.id && link.input_port == *target)
+                    {
+                        run("pw-link", &[&source.id.to_string(), &target.to_string()])?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn stream_intent(&self, stream: &str) -> Result<&str> {
@@ -567,15 +735,13 @@ impl Graph {
             .map(String::as_str)
             .ok_or_else(|| anyhow!("unknown stream {stream}"))
     }
+
     pub fn has_endpoint(&self, endpoint: &str) -> bool {
-        self.endpoint_nodes.contains_key(endpoint)
-    }
-    pub fn endpoint_node(&self, endpoint: &str) -> Result<u32> {
-        self.endpoint_nodes
+        self.endpoint_ports
             .get(endpoint)
-            .copied()
-            .ok_or_else(|| anyhow!("unknown or unavailable endpoint {endpoint}"))
+            .is_some_and(|ports| !ports.is_empty())
     }
+
     pub fn stream_node(&self, stream: &str) -> Result<u32> {
         self.stream_nodes
             .get(stream)
@@ -585,17 +751,11 @@ impl Graph {
 
     pub fn apply_route(&self, stream: &str, targets: &[String]) -> Result<()> {
         let stream_node = self.stream_node(stream)?;
-        let sink_nodes: BTreeSet<u32> = self
-            .snapshot
-            .outputs
-            .iter()
-            .map(|v| v.pipewire_id)
-            .collect();
-        for link in self
-            .links
-            .iter()
-            .filter(|v| v.output_node == stream_node && sink_nodes.contains(&v.input_node))
-        {
+        let all_target_ports: BTreeSet<u32> =
+            self.endpoint_ports.values().flatten().copied().collect();
+        for link in self.links.iter().filter(|link| {
+            link.output_node == stream_node && all_target_ports.contains(&link.input_port)
+        }) {
             run(
                 "pw-link",
                 &[
@@ -605,17 +765,21 @@ impl Graph {
                 ],
             )?;
         }
-        let source_ports: Vec<&Port> = self
+        let mut source_ports: Vec<&Port> = self
             .ports
             .iter()
-            .filter(|v| v.node == stream_node && v.direction == "out")
+            .filter(|port| port.node == stream_node && port.direction == "out")
             .collect();
+        source_ports.sort_by(|a, b| a.channel.cmp(&b.channel).then(a.id.cmp(&b.id)));
         for target in targets {
-            let target_node = self.endpoint_node(target)?;
-            let target_ports: Vec<&Port> = self
-                .ports
+            let ids = self
+                .endpoint_ports
+                .get(target)
+                .filter(|ports| !ports.is_empty())
+                .ok_or_else(|| anyhow!("unknown or unavailable endpoint {target}"))?;
+            let target_ports: Vec<&Port> = ids
                 .iter()
-                .filter(|v| v.node == target_node && v.direction == "in")
+                .filter_map(|id| self.ports.iter().find(|port| port.id == *id))
                 .collect();
             if source_ports.is_empty() || target_ports.is_empty() {
                 bail!("route ports are unavailable for {stream} -> {target}");
@@ -623,7 +787,7 @@ impl Graph {
             for (index, source) in source_ports.iter().enumerate() {
                 let sink = target_ports
                     .iter()
-                    .find(|v| !source.channel.is_empty() && v.channel == source.channel)
+                    .find(|port| !source.channel.is_empty() && port.channel == source.channel)
                     .copied()
                     .unwrap_or(target_ports[index.min(target_ports.len() - 1)]);
                 run("pw-link", &[&source.id.to_string(), &sink.id.to_string()])?;
@@ -645,7 +809,7 @@ impl Graph {
         if let Some(target) = state
             .default_output
             .as_deref()
-            .filter(|target| self.has_endpoint(target))
+            .filter(|target| self.endpoint_nodes.contains_key(*target))
         {
             if self.actual_default_output.as_deref() != Some(target) {
                 self.set_default(target)?;
@@ -654,7 +818,7 @@ impl Graph {
         if let Some(target) = state
             .default_input
             .as_deref()
-            .filter(|target| self.has_endpoint(target))
+            .filter(|target| self.endpoint_nodes.contains_key(*target))
         {
             if self.actual_default_input.as_deref() != Some(target) {
                 self.set_default(target)?;
@@ -664,11 +828,17 @@ impl Graph {
     }
 
     pub fn set_default(&self, endpoint: &str) -> Result<()> {
-        run(
-            "wpctl",
-            &["set-default", &self.endpoint_node(endpoint)?.to_string()],
-        )
+        let Some(node) = self.endpoint_nodes.get(endpoint) else {
+            // A remote default is implemented by routing every unpinned stream to its JackTrip
+            // channel slice. There is deliberately no fake local sink for wpctl to select.
+            if self.has_endpoint(endpoint) {
+                return Ok(());
+            }
+            bail!("unknown or unavailable endpoint {endpoint}");
+        };
+        run("wpctl", &["set-default", &node.to_string()])
     }
+
     pub fn set_volume(&self, object: &str, volume: f64) -> Result<()> {
         if !(0.0..=1.5).contains(&volume) {
             bail!("volume must be between 0.0 and 1.5");
@@ -678,19 +848,22 @@ impl Graph {
             .get(object)
             .or_else(|| self.endpoint_nodes.get(object))
             .copied()
-            .ok_or_else(|| anyhow!("unknown object {object}"))?;
+            .ok_or_else(|| {
+                anyhow!("remote endpoint level control is not available for {object}")
+            })?;
         run(
             "wpctl",
             &["set-volume", &node.to_string(), &format!("{volume:.3}")],
         )
     }
+
     pub fn set_muted(&self, object: &str, muted: bool) -> Result<()> {
         let node = self
             .stream_nodes
             .get(object)
             .or_else(|| self.endpoint_nodes.get(object))
             .copied()
-            .ok_or_else(|| anyhow!("unknown object {object}"))?;
+            .ok_or_else(|| anyhow!("remote endpoint mute control is not available for {object}"))?;
         run(
             "wpctl",
             &["set-mute", &node.to_string(), if muted { "1" } else { "0" }],
@@ -719,7 +892,28 @@ fn run(program: &str, arguments: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::{ControlConfig, PeerConfig, TransportConfig},
+        fabric::{ChannelSlice, Manifest, PeerSnapshot, Role, SessionPlan},
+    };
     use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn config() -> Config {
+        Config {
+            node: "alpha".into(),
+            control: ControlConfig::default(),
+            transport: TransportConfig::default(),
+            peers: BTreeMap::new(),
+            catalogue: BTreeMap::new(),
+        }
+    }
+
+    fn port(id: u32, node: u32, name: &str, direction: &str, channel: &str) -> Value {
+        json!({"id": id, "type": "PipeWire:Interface:Port", "info": {"props": {
+            "node.id": node, "port.name": name, "port.direction": direction, "audio.channel": channel
+        }}})
+    }
 
     #[test]
     fn sanitizes_semantic_identifiers() {
@@ -734,10 +928,13 @@ mod tests {
                 "object.serial": 100, "node.name": "alsa_output.usb-hyperx", "node.description": "HyperX",
                 "media.class": "Audio/Sink", "alsa.nixaudio.device": "hyperx", "device.profile.name": "analog-stereo"
             }}}),
+            port(11, 10, "playback_FL", "in", "FL"),
+            port(12, 10, "playback_FR", "in", "FR"),
             json!({"id": 20, "type": "PipeWire:Interface:Node", "info": {"props": {
                 "object.serial": 200, "node.name": "Firefox", "media.name": "A useful tab",
                 "media.class": "Stream/Output/Audio", "application.name": "Firefox", "application.process.binary": "firefox"
             }}}),
+            port(21, 20, "output_FL", "out", "FL"),
             json!({"id": 30, "type": "PipeWire:Interface:Link", "info": {
                 "output-node-id": 20, "output-port-id": 21, "input-node-id": 10, "input-port-id": 11
             }}),
@@ -745,7 +942,12 @@ mod tests {
                 "key": "default.audio.sink", "value": {"name": "alsa_output.usb-hyperx"}
             }]}),
         ];
-        let graph = Graph::from_values(&values, &Config::default(), &State::default(), 7).unwrap();
+        let state = State {
+            default_output: Some("beta.unavailable".into()),
+            ..State::default()
+        };
+        let graph =
+            Graph::from_values(&values, &config(), &state, &FabricSnapshot::default(), 7).unwrap();
         assert_eq!(graph.snapshot.outputs[0].id, "local.hyperx.analog-stereo");
         assert_eq!(
             graph.snapshot.default_output.as_deref(),
@@ -756,6 +958,79 @@ mod tests {
             graph.snapshot.streams[0].targets,
             ["local.hyperx.analog-stereo"]
         );
-        assert_eq!(graph.snapshot.revision, 7);
+        assert_eq!(graph.local_manifest().outputs[0].channels, ["FL", "FR"]);
+    }
+
+    #[test]
+    fn jacktrip_channel_slice_is_a_remote_pipewire_target() {
+        let mut cfg = config();
+        cfg.peers.insert(
+            "beta".into(),
+            PeerConfig {
+                addresses: vec!["beta.local".into()],
+                control_port: 45900,
+                audio_port: 46001,
+            },
+        );
+        let manifest = Manifest {
+            protocol: 1,
+            node: "beta".into(),
+            revision: 2,
+            outputs: vec![EndpointManifest {
+                id: "local.hyperx".into(),
+                label: "HyperX".into(),
+                channels: vec!["FL".into(), "FR".into()],
+            }],
+            inputs: Vec::new(),
+        };
+        let plan = SessionPlan {
+            peer: "beta".into(),
+            address: "beta.local".into(),
+            audio_port: 46001,
+            node_name: "nixaudio-jt-beta".into(),
+            role: Role::Server,
+            send: vec![ChannelSlice {
+                endpoint: "local.hyperx".into(),
+                first: 1,
+                channels: vec!["FL".into(), "FR".into()],
+            }],
+            receive: Vec::new(),
+            send_channels: 2,
+            receive_channels: 1,
+        };
+        let fabric = FabricSnapshot {
+            peers: BTreeMap::from([(
+                "beta".into(),
+                PeerSnapshot {
+                    address: "beta.local".into(),
+                    manifest,
+                    plan,
+                },
+            )]),
+        };
+        let values = vec![
+            json!({"id": 50, "type": "PipeWire:Interface:Node", "info": {"props": {
+                "object.serial": 500, "node.name": "nixaudio-jt-beta", "node.description": "nixaudio-jt-beta"
+            }}}),
+            port(51, 50, "send_1", "in", "FL"),
+            port(52, 50, "send_2", "in", "FR"),
+            json!({"id": 20, "type": "PipeWire:Interface:Node", "info": {"props": {
+                "object.serial": 200, "node.name": "Firefox", "media.name": "Music",
+                "media.class": "Stream/Output/Audio", "application.name": "Firefox"
+            }}}),
+            port(21, 20, "output_FL", "out", "FL"),
+            json!({"id": 30, "type": "PipeWire:Interface:Link", "info": {
+                "output-node-id": 20, "output-port-id": 21, "input-node-id": 50, "input-port-id": 51
+            }}),
+        ];
+        let graph = Graph::from_values(&values, &cfg, &State::default(), &fabric, 3).unwrap();
+        let output = graph
+            .snapshot
+            .outputs
+            .iter()
+            .find(|endpoint| endpoint.id == "beta.hyperx")
+            .unwrap();
+        assert!(output.available);
+        assert_eq!(graph.snapshot.streams[0].targets, ["beta.hyperx"]);
     }
 }

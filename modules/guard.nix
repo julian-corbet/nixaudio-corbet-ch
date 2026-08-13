@@ -4,7 +4,7 @@
 #
 # A laptop on this fabric had no local audio for 1h45m. Not degraded: `pactl list short cards` was
 # EMPTY while `/proc/asound/cards` listed all four and `aplay -l` worked. The only sinks left were
-# the fabric's own tunnels, so the default sink silently became a network mirror of another host and
+# the cross-host routes, so the default sink silently became another host's output and
 # the machine went quiet. Nothing alerted, because nothing was down — pipewire ran, pipewire-pulse
 # answered every query, wireplumber was `active (running)`. The graph was simply empty.
 #
@@ -239,7 +239,7 @@ in
         enumeration exactly the same way. Turning it off is supported and means only that this host
         prefers to notice by ear.
 
-        Read defensively, the same way this repo reads `nixusb`/`nixnet`: the home-manager plane
+        Read defensively, the same way this repo reads `nixusb`: the home-manager plane
         does not import ./backend.nix (package selection is a system concern, and on a distro host
         the packages are pacman's), so there the fabric is what there is to follow.
       '';

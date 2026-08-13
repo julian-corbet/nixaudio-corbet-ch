@@ -1,155 +1,153 @@
 # nixaudio
 
-`nixaudio` turns PipeWire's implementation graph into a small, stable audio product:
+`nixaudio` presents the audio of several Linux machines as one small semantic system. Applications
+remain ordinary PipeWire clients. [JackTrip](https://github.com/jacktrip/jacktrip) carries real-time
+audio between machines. Rust owns the product behavior around both.
 
-| Layer | Responsibility |
+## User story
+
+The tray lists every active playback stream and lets the user choose one or more outputs with
+`device.output` names:
+
+| Source | Output choices |
 |---|---|
-| Nix modules | backend packages, stable hardware names, peer catalogue, listener policy and units |
-| `nixaudiod` | the only nixaudio process that observes or changes PipeWire; routes, defaults, health, hotplug and fabric tunnels |
-| `nixaudioctl` | diagnosis and scripting through the public D-Bus API |
-| `nixaudio-tray` | compositor-independent StatusNotifier frontend; it never calls PipeWire tools |
+| Firefox · video | `local.speakers`, `archlxc.hyperx`, `server.devhome` |
+| Music player · album | `local.hyperx`, `server.devhome` |
 
-The normal interface is semantic. It says `local.hyperx` or `studio.shure`, not “node 147” or
-“module-tunnel-sink 536870928”. PipeWire IDs are included only in the inspector for diagnosis.
+Each stream also has volume and mute controls. The top level shows the default output, default
+microphone, health, and circle membership. PipeWire IDs, JackTrip channels and reconnect mechanics
+remain diagnostic details.
 
-## What works
-
-| Capability | Current implementation |
-|---|---|
-| Stable local device identity | WirePlumber rules carry `alsa.nixaudio.device` from declared USB or explicit hardware identity onto its nodes |
-| Live graph | `pw-dump --monitor` wakes an event-driven semantic rebuild; clients receive a D-Bus `Changed` signal |
-| Routing | each playback stream maps to a set of outputs, so one-to-many playback is a first-class route |
-| Persistence | explicit stream routes and default input/output intent are atomically stored under `$XDG_STATE_HOME/nixaudio/` |
-| Hotplug/restart | remembered intent is reapplied whenever the matching stream and endpoint exist again |
-| Device sharing | declared peers are probed and all of their sinks and sources are mirrored through isolated PipeWire tunnel nodes |
-| Frontend | StatusNotifier menu with output and microphone defaults, volume/mute, per-stream route checkboxes and peer health |
-| Diagnostics | `nixaudioctl inspect` returns the complete versioned semantic snapshot as JSON |
-
-## User model
-
-A route has three visible dimensions:
+## Architecture
 
 ```text
-source stream  ->  device.output
-Firefox        ->  local.hyperx
-Music player   ->  studio.shure
-Music player   ->  local.speakers
+application stream
+  -> local PipeWire links
+  -> JackTrip send channel slice
+  -> one multichannel UDP session for that peer
+  -> JackTrip receive channel slice
+  -> remote PipeWire links
+  -> physical or virtual output
 ```
 
-The location is `local` unless the endpoint belongs to another member of the sharing circle. A
-source can select more than one output. Tunnels, ports, channel links and reconnect mechanics stay
-inside the backend.
+| Component | Owns | Does not own |
+|---|---|---|
+| PipeWire + WirePlumber | each host's live devices, streams, ports, mixing and local policy | WAN transport or fleet identity |
+| upstream JackTrip 3.0.0 | low-latency multichannel UDP media, jitter buffering and packet redundancy | device discovery, UI or remembered routes |
+| `nixaudiod` | semantic IDs, live manifests, peer supervision, channel allocation, PipeWire links, state and D-Bus | audio encoding or a second media graph |
+| `nixaudio-tray` | StatusNotifier UI over the daemon API | direct PipeWire or JackTrip control |
+| Nix modules | packages, stable node/device identity, circle membership, addresses, ports and units | live routing intent |
 
-The tray remains usable while the daemon is absent or restarting: it shows a disconnected state and
-reconnects. It does not maintain a competing cache or graph writer.
+There is one direct bidirectional JackTrip process per peer pair, not per stream and not per output.
+All outputs owned by the receiving peer occupy deterministic channel slices inside that session.
+PipeWire performs the actual n-to-n mixing at both ends.
 
-## Runtime API
+## Current implementation
 
-The session service is `ch.corbet.NixAudio1`, object `/ch/corbet/NixAudio1`, API version 1.
+| Capability | State |
+|---|---|
+| Stable local device identity | WirePlumber rules derive semantic names from declared USB or explicit hardware identity |
+| Live graph and hotplug | `pw-dump --monitor`, rebuilt into a versioned snapshot and emitted over D-Bus |
+| Per-stream n-to-n routing | native `pw-link` links; remembered by application/media intent rather than volatile node ID |
+| Local defaults, volume and mute | implemented through `wpctl` |
+| Cross-host output discovery | live peer manifests; no evaluation-time guesses or fake sinks |
+| Cross-host media | pinned upstream JackTrip 3.0.0 through PipeWire's JACK compatibility layer |
+| Multiplexing | one asymmetric multichannel connection per peer, with deterministic endpoint slices |
+| Address failover | ordered peer address lists; the first answering control address is used |
+| Process failover | dead, changed or stale JackTrip workers are restarted or removed by reconciliation |
+| Frontend | tray defaults, stream volume/mute, route checkboxes and peer state |
+| Remote output level control | not yet; levels remain stream-local in this slice |
+| Remote microphone consumption | manifested but not yet exposed as a local capture target |
+| Internet authentication/encryption | not yet; the first slice is trusted-LAN only |
+
+## Naming and API
+
+`local.speakers` means an output on this machine; `studio.hyperx` means the HyperX output announced
+live by peer `studio`. A stream may target several of them. PipeWire numeric IDs appear in
+`nixaudioctl inspect` only for diagnosis.
+
+The session D-Bus service is `ch.corbet.NixAudio2`, object `/ch/corbet/NixAudio2`, API version 2.
 
 | Method | Meaning |
 |---|---|
-| `Inspect()` | return the semantic snapshot as versioned JSON |
+| `Inspect()` | complete semantic snapshot as JSON |
 | `Route(stream, outputs[])` | replace one stream's explicit target set |
-| `ClearRoute(stream)` | return the stream to the selected default output |
-| `SetDefaultOutput(endpoint)` | select and remember the output default |
-| `SetDefaultInput(endpoint)` | select and remember the microphone default |
-| `SetVolume(object, value)` | set stream or endpoint volume from `0.0` through `1.5` |
-| `SetMuted(object, bool)` | set stream or endpoint mute |
+| `ClearRoute(stream)` | make the stream follow nixaudio's default output |
+| `SetDefaultOutput(endpoint)` | remember the default output, local or remote |
+| `SetDefaultInput(endpoint)` | remember the local default microphone |
+| `SetVolume(object, value)` | set local stream or endpoint volume from `0.0` through `1.5` |
+| `SetMuted(object, bool)` | set local stream or endpoint mute |
 | `Changed(revision)` | notify clients after a semantic graph change |
-
-CLI examples:
 
 ```bash
 nixaudioctl inspect
-nixaudioctl default-output local.hyperx.analog_stereo
-nixaudioctl route stream:123 local.speakers.analog_stereo studio.shure.analog_stereo
-nixaudioctl mute local.hyperx.analog_stereo on
+nixaudioctl default-output archlxc.hyperx.analog_stereo
+nixaudioctl route stream:123 local.speakers.analog_stereo archlxc.hyperx.analog_stereo
+nixaudioctl mute stream:123 on
 ```
 
 ## Declarative use
 
-The flake exports:
-
 | Output | Use |
 |---|---|
 | `nixosModules.nixaudio` | complete NixOS plane |
-| `systemManagerModules.nixaudio` | Arch/CachyOS host configuration under `/etc` |
-| `homeManagerModules.nixaudio` | Arch/CachyOS user services, state and tray |
-| `packages.<system>.nixaudio` | all three Rust binaries |
-
-Minimal policy:
+| `systemManagerModules.nixaudio` | Arch/CachyOS host facts and `/etc` configuration |
+| `homeManagerModules.nixaudio` | Arch/CachyOS user daemon and tray |
+| `packages.<system>.nixaudio` | Rust daemon, CLI and tray |
+| `packages.<system>.jacktrip` | pinned upstream JackTrip 3.0.0 |
 
 ```nix
 {
   nixaudio = {
-    backend.enable = true;
-    daemon.enable = true;
     daemon.user = "alice"; # NixOS only
     tray.enable = true;
 
     fabric = {
       enable = true;
-      listen.address = "192.0.2.10";
-      peers.studio.host = "studio";
+      node = "laptop";
+      control.listen = "192.168.1.10";
+      peers.studio = {
+        addresses = [ "192.168.1.20" ];
+        audioPort = 46001;
+      };
     };
   };
 }
 ```
 
-On an Arch host using both system-manager and Home Manager, system-manager owns the generated
-`/etc/nixaudio/config.json`; Home Manager uses:
+An Arch host composes the system-manager and Home Manager planes. The system plane writes
+`/etc/nixaudio/config.json`; Home Manager points its user service at it:
 
 ```nix
 nixaudio.daemon.externalConfigPath = "/etc/nixaudio/config.json";
 ```
 
-The runtime package is intentionally unwrapped. NixOS units put the matching nixpkgs PipeWire tools
-on `PATH`; Arch units use `/usr/bin`, so the client tools always match the sound server actually
-running on that host.
-
-## Device declarations
-
-USB devices normally come from the shared `nixusb.devices` inventory with the `audio` tag. Explicit
-hardware uses the same stable-name contract:
-
-```nix
-nixaudio.devices.internal = {
-  description = "Laptop audio";
-  match = { "device.bus-id" = "pci-0000:00:1f.3"; };
-};
-```
-
-`nixaudio.priorities.<device>.sink` and `.source` tune WirePlumber's default selection. Profile
-narrowing uses WirePlumber's `device.profile.name`, never a card ordinal.
+The Arch service uses `/usr/bin/pw-jack` so JackTrip enters the distro PipeWire graph. NixOS uses
+the matching `pkgs.pipewire.jack` wrapper. JackTrip remains an upstream source build pinned by hash;
+it is not vendored or forked.
 
 ## Security boundary
 
-The present sharing transport is PipeWire Pulse TCP over explicitly declared peers. On the deployed
-PipeWire generation its cookie is not an authentication boundary; the listener must therefore be
-bound and firewalled to a trusted network. Audio is not encrypted by nixaudio today.
+The control manifest protocol and classic JackTrip P2P UDP media are currently unauthenticated and
+unencrypted. Bind and firewall them to a trusted LAN. The next transport milestone is pairing plus
+authenticated, encrypted sessions; it must preserve the semantic API and can replace the connection
+adapter without replacing the UI or local PipeWire graph.
 
-This transport is deliberately behind `nixaudiod`. Replacing it with authenticated, encrypted media
-transport does not change the tray, D-Bus API, semantic identities or persisted routes. JackTrip is a
-strong candidate for that adapter, but it is not claimed or bundled before that work is implemented
-and measured.
+## Verification
 
-## Repository map
-
-| Path | Contents |
-|---|---|
-| `src/` | Rust model, daemon, CLI, tray and fabric reconciler |
-| `modules/` | shared Nix policy and NixOS projection |
-| `system-manager/` | Arch/CachyOS system projection |
-| `home/` | user-service and tray projection |
-| `checks/` | pure module contract checks; the Rust package check also runs unit tests |
-| `experiments/` | measured investigations retained as evidence |
-
-Build and check on a suitable build host:
+Build and test on a suitable build host:
 
 ```bash
 nix flake check
 nix build .#nixaudio
+nix build .#jacktrip
 ```
 
-Licensed under MIT.
+`experiments/two-node-smoke.sh` is the privileged live-media acceptance test. It gives two real
+JackTrip processes separate Linux network namespaces, routes a generated tone through a non-first
+channel, records the opposite PipeWire port, and fails on silence. Run it on a disposable build
+host with a logged-in PipeWire session; its required tools are listed and checked by the script.
+
+The nixaudio Rust code is MIT. The pinned JackTrip build remains under its upstream mixed-license
+terms; its own `--version` output identifies the build as LGPL and points to upstream `LICENSE.md`
+for the MIT/GPL portions.

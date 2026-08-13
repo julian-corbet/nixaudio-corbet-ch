@@ -4,15 +4,22 @@
 let
   cfg = config.nixaudio;
   package = import ../package.nix { inherit pkgs; };
-  peerTable = lib.listToAttrs (lib.mapAttrsToList
-    (name: peer: lib.nameValuePair peer.host name)
-    cfg.fabric.peers);
   daemonConfig = {
-    port = cfg.fabric.listen.port;
-    listen = cfg.fabric.listen.address;
-    loopName = cfg.fabric.loopName;
-    mirrorPriority = cfg.fabric.mirrorPriority;
-    peers = peerTable;
+    node = cfg.fabric.node;
+    control = cfg.fabric.control;
+    transport = {
+      command = cfg.fabric.transport.command;
+      sampleRate = cfg.fabric.transport.sampleRate;
+      period = cfg.fabric.transport.period;
+      bitResolution = cfg.fabric.transport.bitResolution;
+      queue = cfg.fabric.transport.queue;
+      redundancy = cfg.fabric.transport.redundancy;
+    };
+    peers = lib.mapAttrs
+      (_: peer: {
+        inherit (peer) addresses controlPort audioPort;
+      })
+      cfg.fabric.peers;
     catalogue = cfg.fabric.catalogue;
   };
 in

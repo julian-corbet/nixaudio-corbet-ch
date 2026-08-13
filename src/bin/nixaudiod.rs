@@ -22,6 +22,7 @@ struct Runtime {
     config: Config,
     state: State,
     state_path: PathBuf,
+    fabric: fabric::Snapshot,
     graph: Graph,
     revision: u64,
 }
@@ -77,14 +78,14 @@ impl Controller {
                 .snapshot
                 .outputs
                 .iter()
-                .any(|v| v.id == endpoint)
+                .any(|v| v.id == endpoint && v.available)
         } else {
             runtime
                 .graph
                 .snapshot
                 .inputs
                 .iter()
-                .any(|v| v.id == endpoint)
+                .any(|v| v.id == endpoint && v.available)
         };
         if !valid {
             anyhow::bail!(
@@ -126,7 +127,7 @@ fn dbus_error(error: anyhow::Error) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(error.to_string())
 }
 
-#[zbus::interface(name = "ch.corbet.NixAudio1")]
+#[zbus::interface(name = "ch.corbet.NixAudio2")]
 impl AudioService {
     #[zbus(property)]
     fn api_version(&self) -> u32 {
@@ -190,29 +191,39 @@ async fn watch_pipewire(events: mpsc::Sender<()>) {
     }
 }
 
-fn refresh(controller: &Controller) -> Result<u64> {
+fn refresh(controller: &Controller, published: &Arc<RwLock<fabric::Manifest>>) -> Result<u64> {
     let mut runtime = controller.inner.write().unwrap();
     if let Ok(config) = Config::load() {
         runtime.config = config;
     }
     let next = runtime.revision + 1;
-    let graph = Graph::inspect(&runtime.config, &runtime.state, next)?;
+    let graph = Graph::inspect(&runtime.config, &runtime.state, &runtime.fabric, next)?;
+    if let Err(error) = graph.reconcile_transport() {
+        eprintln!("nixaudiod: reconcile JackTrip links: {error}");
+    }
     if let Err(error) = graph.reconcile_defaults(&runtime.state) {
         eprintln!("nixaudiod: reconcile defaults: {error}");
     }
     for stream in &graph.snapshot.streams {
-        if !stream.explicit_targets.is_empty()
-            && stream.targets != stream.explicit_targets
-            && stream
-                .explicit_targets
-                .iter()
-                .all(|v| graph.has_endpoint(v))
-        {
-            if let Err(error) = graph.apply_route(&stream.id, &stream.explicit_targets) {
-                eprintln!("nixaudiod: reconcile {}: {error}", stream.application);
+        let targets = if !stream.explicit_targets.is_empty() {
+            Some(stream.explicit_targets.as_slice())
+        } else {
+            graph
+                .snapshot
+                .default_output
+                .as_ref()
+                .map(std::slice::from_ref)
+        };
+        if let Some(targets) = targets {
+            if stream.targets != targets && targets.iter().all(|target| graph.has_endpoint(target))
+            {
+                if let Err(error) = graph.apply_route(&stream.id, targets) {
+                    eprintln!("nixaudiod: reconcile {}: {error}", stream.application);
+                }
             }
         }
     }
+    *published.write().unwrap() = graph.local_manifest();
     runtime.graph = graph;
     runtime.revision = next;
     Ok(next)
@@ -223,13 +234,17 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let state_path = state_path();
     let state = State::load(&state_path)?;
-    let graph = Graph::inspect(&config, &state, 1).context("inspect initial PipeWire graph")?;
+    let initial_fabric = fabric::Snapshot::default();
+    let graph = Graph::inspect(&config, &state, &initial_fabric, 1)
+        .context("inspect initial PipeWire graph")?;
+    let published = Arc::new(RwLock::new(graph.local_manifest()));
     let (events_tx, mut events_rx) = mpsc::channel(32);
     let controller = Controller {
         inner: Arc::new(RwLock::new(Runtime {
-            config,
+            config: config.clone(),
             state,
             state_path,
+            fabric: initial_fabric,
             graph,
             revision: 1,
         })),
@@ -246,10 +261,25 @@ async fn main() -> Result<()> {
     eprintln!("nixaudiod: serving {INTERFACE} API v{API_VERSION}");
 
     tokio::spawn(watch_pipewire(events_tx.clone()));
-    if std::env::var_os("NIXAUDIO_DISABLE_FABRIC").is_none() {
+    if std::env::var_os("NIXAUDIO_DISABLE_NETWORK").is_none() {
+        let server_config = config.clone();
+        let server_manifest = published.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) =
+                    fabric::serve(server_config.clone(), server_manifest.clone()).await
+                {
+                    eprintln!("nixaudiod: control server: {error:#}");
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+
         let fabric_controller = controller.clone();
         let fabric_events = events_tx.clone();
+        let local_manifest = published.clone();
         tokio::spawn(async move {
+            let mut transport = fabric::Runtime::default();
             loop {
                 let config = match Config::load() {
                     Ok(config) => {
@@ -261,13 +291,13 @@ async fn main() -> Result<()> {
                         fabric_controller.inner.read().unwrap().config.clone()
                     }
                 };
-                match tokio::task::spawn_blocking(move || fabric::reconcile(&config)).await {
-                    Ok(Err(error)) => eprintln!("nixaudiod: fabric reconciliation: {error}"),
-                    Err(error) => eprintln!("nixaudiod: fabric worker: {error}"),
-                    _ => {}
+                let manifest = local_manifest.read().unwrap().clone();
+                match transport.reconcile(&config, &manifest).await {
+                    Ok(snapshot) => fabric_controller.inner.write().unwrap().fabric = snapshot,
+                    Err(error) => eprintln!("nixaudiod: fabric reconciliation: {error:#}"),
                 }
                 let _ = fabric_events.try_send(());
-                sleep(Duration::from_secs(15)).await;
+                sleep(Duration::from_secs(2)).await;
             }
         });
     }
@@ -276,7 +306,8 @@ async fn main() -> Result<()> {
         sleep(Duration::from_millis(120)).await;
         while events_rx.try_recv().is_ok() {}
         let worker = controller.clone();
-        match tokio::task::spawn_blocking(move || refresh(&worker)).await {
+        let worker_manifest = published.clone();
+        match tokio::task::spawn_blocking(move || refresh(&worker, &worker_manifest)).await {
             Ok(Ok(revision)) => {
                 let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
                 AudioService::changed(&emitter, revision).await?;

@@ -64,12 +64,10 @@ in
       # definition that is a build error, as a default it would be silence nobody declared.
       wireplumber.enable = true;
 
-      # mkDefault: routing ALSA-native clients through PipeWire is what this backend wants
-      # everywhere, but it is the one layer a host might genuinely need to take back (a machine
-      # driving hardware from a professional ALSA path of its own). pulse below is NOT mkDefault --
-      # see ../lib/packages.nix's pipewire-pulse entry for why it is not negotiable here.
+      # These are local application compatibility layers. Neither is the network transport.
       alsa.enable = lib.mkDefault true;
       pulse.enable = true;
+      jack.enable = true;
     };
 
     environment.systemPackages = map package cfg.packageNames;

@@ -1,7 +1,7 @@
 #[zbus::proxy(
-    interface = "ch.corbet.NixAudio1",
-    default_service = "ch.corbet.NixAudio1",
-    default_path = "/ch/corbet/NixAudio1"
+    interface = "ch.corbet.NixAudio2",
+    default_service = "ch.corbet.NixAudio2",
+    default_path = "/ch/corbet/NixAudio2"
 )]
 pub trait Audio {
     #[zbus(property)]

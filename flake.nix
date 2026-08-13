@@ -5,13 +5,11 @@
   inputs.system-manager.url = "github:numtide/system-manager";
   inputs.system-manager.inputs.nixpkgs.follows = "nixpkgs";
 
-  # NOTE: nixusb and nixnet are deliberately NOT flake inputs.
+  # nixusb is deliberately not a flake input.
   #
-  # This module reads `config.nixusb.devices or { }` and `config.nixnet.peers or { }` defensively at
-  # eval time — the same idiom nixwatch uses for nixpush, and nixhost for nixnet.interfaces. A host
-  # that composes those siblings gets the derived behaviour; a host that does not still evaluates,
-  # and simply has to state its devices and peers itself. Taking them as inputs would force every
-  # consumer to adopt all three, which is exactly the coupling the family avoids.
+  # A host that composes nixusb gets stable USB identity from its shared inventory. Peer membership
+  # is always explicit nixaudio data: an audio circle must not silently grow whenever a generic
+  # network peer appears, and no overlay product is part of the transport contract.
   outputs = { self, nixpkgs, system-manager }:
     let
       lib = nixpkgs.lib;
@@ -64,6 +62,7 @@
         in
         {
           nixaudio = import ./package.nix { inherit pkgs; };
+          jacktrip = import ./jacktrip-package.nix { inherit pkgs; };
           alsa-guard = moduleEval.config.nixaudio.guard.package;
           fabric-health = moduleEval.config.nixaudio.fabric.healthCheck;
           default = self.packages.${system}.nixaudio;

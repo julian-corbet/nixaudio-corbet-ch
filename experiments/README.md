@@ -1,21 +1,21 @@
 # experiments
 
-Things tried against the real fleet, with what actually happened. When an experiment settles a
-question the conclusion moves to [`../studies/`](../studies/README.md); the experiment stays here as
-its evidence.
+Measured results that shaped the current design.
 
-| Experiment | Question | Outcome |
+| Experiment | Result | Design consequence |
 |---|---|---|
-| `pw-dump` property survey | Which PipeWire device properties survive a replug and a reboot? | `device.vendor.id` (`0x`-prefixed), `device.product.id`, `device.bus-id` stable; `api.alsa.path` and `device.bus-path` not. Shaped the matcher design |
-| Prior-art re-check (2026-07) | Has upstream shipped anything that replaces the mirroring daemon? | No. AES67 needs PTP + multicast, ROC has no discovery, zeroconf-discover drops sources. Daemon stays |
+| PipeWire property survey | USB vendor/product IDs and bus ID survive replug; `hw:N` and physical bus path do not | stable WirePlumber carrier names |
+| JackTrip 3.0 source build | pinned v3.0.0 builds successfully from upstream source in the flake | upstream media engine, no vendoring |
+| JackTrip through `pw-jack` | a process appears as ordinary PipeWire ports named `send_N` and `receive_N` | native PipeWire linking; no fake sink layer |
+| Asymmetric channel probe | `--sendchannels 3 --receivechannels 5 -D` exposes exactly three send and five receive ports with no auto-links | deterministic multichannel slices per peer |
+| Two-node media smoke test | `two-node-smoke.sh` puts complementary JackTrip peers in separate network namespaces, links a 997 Hz source through channel 2, records the remote PipeWire port, and rejects silence | the real PipeWire/UDP media path, including same-port operation on distinct hosts |
+| Hub and P2P probe | both modes work; direct P2P permits peer-specific asymmetric channel plans | one P2P process per peer pair for the first slice |
 
-## Open questions worth an experiment
+## Next experiments
 
-- **Does a mirror still win the default-sink race on a host with no real output?** Expected yes —
-  priority lowering cannot make a sole candidate ineligible. Confirm, and decide whether the fix
-  belongs in the consuming app or in a WirePlumber policy this module could own.
-- **Does `pactl -s tcp:<name>:4713` re-resolve on reconnect?** The whole nixnet delegation rests on
-  a peer NAME being re-resolved after a transport flips. If the tunnel module caches the resolved
-  address at load time, roaming needs an explicit tunnel reload on nixnet's publish event.
-- **Two units of one model.** The `device.bus-id` regex narrowing is derived from a single device's
-  `pw-dump`. Verify with two identical headsets attached at once.
+| Question | Acceptance signal |
+|---|---|
+| Failover | killing JackTrip or removing the primary address recovers without changing semantic route IDs |
+| Packet impairment | recorded loss/jitter thresholds and sane queue/redundancy defaults |
+| Remote capture | a peer microphone becomes a selectable semantic source without feedback loops |
+| Secure Internet mode | paired peers reject unknown nodes and media/control are confidential across NAT |

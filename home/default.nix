@@ -4,7 +4,7 @@
 #
 # Two of the three fleet nodes (a laptop and an Arch/CachyOS container, say) are not NixOS, and the
 # audio graph on them is a USER-session concern: PipeWire runs as the logged-in user, its config
-# lives under ~/.config, and the mirroring daemon is a `systemd --user` unit. nixarch's package
+# lives under ~/.config, and nixaudiod is a `systemd --user` unit. nixarch's package
 # reconciler is pacman/AUR convergence only — it has no file-placement or user-unit primitive — so it
 # cannot put any of this in place. home-manager is the mechanism that can.
 #
@@ -67,6 +67,13 @@ in
     # failure that follows from both writing.
     { nixaudio.dropIns = lib.mkDefault "user"; }
 
+    (lib.mkIf cfg.fabric.enable {
+      nixaudio.fabric.transport.command = [
+        "/usr/bin/pw-jack"
+        "${cfg.fabric.transport.package}/bin/jacktrip"
+      ];
+    })
+
     # ── The guard, and why it lives HERE on a non-NixOS host ─────────────────────────────────
     # It is a `systemd --user` unit, and this is the only plane on such a host with a real one.
     # system-manager can write /etc/systemd/user, but it never reloads the user manager, so a unit
@@ -127,16 +134,7 @@ in
 
     (lib.mkIf cfg.fabric.enable {
       xdg.configFile =
-        # The PipeWire/WirePlumber drop-ins, only when this plane owns them. Both read from the user's
-        # XDG config dir, which takes precedence over the distro's own /usr/share defaults without
-        # modifying anything pacman owns.
         lib.optionalAttrs (cfg.dropIns == "user") {
-          "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf".text =
-            builtins.toJSON cfg.fabric.pipewireConfig."50-fabric-loops";
-
-          "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf".text =
-            builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
-
           "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
         };
     })
@@ -145,7 +143,7 @@ in
     # external config, Home Manager does not need to duplicate the host's listener or peer facts at
     # all; it owns only the user-service lifecycle while system-manager owns /etc.
     (lib.mkIf cfg.daemon.enable {
-      home.packages = [ cfg.daemon.package ];
+      home.packages = [ cfg.daemon.package cfg.fabric.transport.package ];
 
       xdg.configFile = lib.optionalAttrs (cfg.daemon.externalConfigPath == null) {
         ${configRelPath}.source = cfg.daemon.configFile;
@@ -155,11 +153,8 @@ in
         nixaudiod = {
           Unit = {
             Description = "nixaudio PipeWire control plane";
-            # Wants rather than Requires: pipewire-pulse is socket-activated, and the daemon's own
-            # self-heal path handles a pulse that disappears later. A hard Requires would drag the
-            # daemon down with it and defeat that recovery.
-            After = [ "pipewire-pulse.service" ];
-            Wants = [ "pipewire-pulse.service" ];
+            After = [ "pipewire.service" "wireplumber.service" ];
+            Wants = [ "pipewire.service" "wireplumber.service" ];
           };
 
           Service = {

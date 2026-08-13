@@ -60,6 +60,13 @@ in
         cfg.guard.wireplumberConfig;
     })
 
+    (lib.mkIf cfg.fabric.enable {
+      nixaudio.fabric.transport.command = [
+        "/usr/bin/pw-jack"
+        "${cfg.fabric.transport.package}/bin/jacktrip"
+      ];
+    })
+
     (lib.mkIf cfg.backend.enable {
       assertions = [
         {
@@ -77,18 +84,8 @@ in
     })
 
     (lib.mkIf (cfg.fabric.enable && cfg.dropIns == "system") {
-      environment.etc = {
-        # /etc/pipewire/*.conf.d is read by the distro's PipeWire exactly as /etc/wireplumber is by
-        # WirePlumber, so a system-wide drop-in reaches every user session without touching
-        # dotfiles.
-        "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf".text =
-          builtins.toJSON cfg.fabric.pipewireConfig."50-fabric-loops";
-
-        "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf".text =
-          builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
-
-        "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-      };
+      environment.etc."wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text =
+        cfg.namingConfig;
     })
 
     # system-manager owns the host-level fabric facts on Arch: the listener address and peer table
@@ -96,6 +93,7 @@ in
     # the user service against this file without repeating either value in its separate evaluation.
     (lib.mkIf cfg.daemon.enable {
       environment.etc."nixaudio/config.json".source = cfg.daemon.configFile;
+      environment.systemPackages = [ cfg.fabric.transport.package ];
     })
   ];
 }
