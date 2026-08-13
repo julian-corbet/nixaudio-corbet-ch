@@ -74,6 +74,7 @@ struct Node {
     serial: u64,
     name: String,
     description: String,
+    media_name: String,
     media_class: String,
     application: String,
     application_id: String,
@@ -269,6 +270,7 @@ impl Graph {
                                     v
                                 }
                             },
+                            media_name: text(props, "media.name"),
                             media_class: text(props, "media.class"),
                             application: {
                                 let v = text(props, "application.name");
@@ -409,16 +411,13 @@ impl Graph {
             } else {
                 &node.application_id
             };
-            let intent_key = format!("{}|{}|{}", app_key, node.media_role, node.name);
-            let mut targets: BTreeSet<String> = links
+            let intent_key = format!("{}|{}|{}", app_key, node.media_role, node.media_name);
+            let targets: BTreeSet<String> = links
                 .iter()
                 .filter(|l| l.output_node == node.id)
                 .filter_map(|l| node_endpoints.get(&l.input_node).cloned())
                 .collect();
             let explicit_targets = state.routes.get(&intent_key).cloned().unwrap_or_default();
-            if targets.is_empty() {
-                targets = explicit_targets.clone();
-            }
             streams.push(Stream {
                 id: id.clone(),
                 intent_key: intent_key.clone(),
@@ -427,7 +426,11 @@ impl Graph {
                 } else {
                     node.application.clone()
                 },
-                title: node.description.clone(),
+                title: if node.media_name.is_empty() {
+                    node.description.clone()
+                } else {
+                    node.media_name.clone()
+                },
                 volume: node.volume,
                 muted: node.muted,
                 targets: targets.into_iter().collect(),
@@ -716,10 +719,43 @@ fn run(program: &str, arguments: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sanitizes_semantic_identifiers() {
         assert_eq!(safe("HyperX Cloud III S"), "hyperx_cloud_iii_s");
         assert_eq!(safe("alsa_output.usb-1"), "alsa_output_usb-1");
+    }
+
+    #[test]
+    fn joins_stream_links_to_stable_endpoints() {
+        let values = vec![
+            json!({"id": 10, "type": "PipeWire:Interface:Node", "info": {"props": {
+                "object.serial": 100, "node.name": "alsa_output.usb-hyperx", "node.description": "HyperX",
+                "media.class": "Audio/Sink", "alsa.nixaudio.device": "hyperx", "device.profile.name": "analog-stereo"
+            }}}),
+            json!({"id": 20, "type": "PipeWire:Interface:Node", "info": {"props": {
+                "object.serial": 200, "node.name": "Firefox", "media.name": "A useful tab",
+                "media.class": "Stream/Output/Audio", "application.name": "Firefox", "application.process.binary": "firefox"
+            }}}),
+            json!({"id": 30, "type": "PipeWire:Interface:Link", "info": {
+                "output-node-id": 20, "output-port-id": 21, "input-node-id": 10, "input-port-id": 11
+            }}),
+            json!({"id": 40, "type": "PipeWire:Interface:Metadata", "metadata": [{
+                "key": "default.audio.sink", "value": {"name": "alsa_output.usb-hyperx"}
+            }]}),
+        ];
+        let graph = Graph::from_values(&values, &Config::default(), &State::default(), 7).unwrap();
+        assert_eq!(graph.snapshot.outputs[0].id, "local.hyperx.analog-stereo");
+        assert_eq!(
+            graph.snapshot.default_output.as_deref(),
+            Some("local.hyperx.analog-stereo")
+        );
+        assert_eq!(graph.snapshot.streams[0].title, "A useful tab");
+        assert_eq!(
+            graph.snapshot.streams[0].targets,
+            ["local.hyperx.analog-stereo"]
+        );
+        assert_eq!(graph.snapshot.revision, 7);
     }
 }

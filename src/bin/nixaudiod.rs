@@ -251,7 +251,16 @@ async fn main() -> Result<()> {
         let fabric_events = events_tx.clone();
         tokio::spawn(async move {
             loop {
-                let config = fabric_controller.inner.read().unwrap().config.clone();
+                let config = match Config::load() {
+                    Ok(config) => {
+                        fabric_controller.inner.write().unwrap().config = config.clone();
+                        config
+                    }
+                    Err(error) => {
+                        eprintln!("nixaudiod: keep last configuration: {error}");
+                        fabric_controller.inner.read().unwrap().config.clone()
+                    }
+                };
                 match tokio::task::spawn_blocking(move || fabric::reconcile(&config)).await {
                     Ok(Err(error)) => eprintln!("nixaudiod: fabric reconciliation: {error}"),
                     Err(error) => eprintln!("nixaudiod: fabric worker: {error}"),
