@@ -349,6 +349,10 @@ the daemon's own reconciliation are what know that, continuously, against the re
 
 ## Routing intent is state, not configuration
 
+The runtime control-plane boundary and migration path are specified in
+[`CONTROL-PLANE.md`](./CONTROL-PLANE.md). The short version: `nixaudiod` is the sole live-graph
+writer, while `nixaudio-tray` is a thin D-Bus frontend over semantic devices rather than raw ports.
+
 There is deliberately no option here shaped like `nixaudio.fabric.routes.<stream> = "<sink>"`. The
 correct destination for a stream is a property of a *live* session — which window got forwarded
 where, which peer is reachable, which sink a human is listening on right now — none of which exists
