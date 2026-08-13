@@ -3,16 +3,12 @@
 **Audio as one declared fleet-wide fact: stable device names drawn from the shared USB inventory,
 and a many-to-many cross-host device pool addressed by name rather than by address.**
 
-Status: **composed and running on all three hosts of the reference fleet, symmetric in production.**
-The device-naming layer, the fabric policy, the stable-name catalogue, the packaged daemon, the
-local guard, the health check, all three planes and the evaluation checks are complete. Every host
-mirrors every other host's real devices — including a host with no local hardware of its own (a
-pure-software null sink, declared directly via `nixaudio.devices`-adjacent config rather than a
-USB-derived entry) and a host whose devices only exist because a co-resident container's kernel
-modules were loaded on its behalf. Before assuming symmetry alone makes a new host's join correct,
-read *What deriving from nixnet does and does not guarantee* below — it is still exactly as true
-now as when only one host had adopted this. See *Migration* below for the breaking consequence
-worth reading before any future switch.
+Status: the device-naming layer, fabric policy, stable-name catalogue, packaged daemon, local guard,
+health check, all three planes and the evaluation checks are complete. A deployment's current
+symmetry is runtime state, not a property this public module can truthfully certify; verify the live
+peer table and tunnels on every host. Before assuming a declared peer set makes a new host's join
+correct, read *What deriving from nixnet does and does not guarantee* below. See *Migration* below
+for the breaking consequence worth reading before any future switch.
 
 **Not hypothetical — a version of this failure has now happened twice, from two different causes.**
 An earlier deployment of this same pattern, hand-placed rather than declared, showed it happen across
@@ -378,8 +374,8 @@ header for the full reasoning.
 | Host | Import | Projection |
 |---|---|---|
 | NixOS | `nixosModules.nixaudio` | `services.pipewire.extraConfig`, `/etc`, `systemd.user.services` + a timer |
-| Arch / CachyOS, system layer | `systemManagerModules.nixaudio` | `/etc/pipewire/*.conf.d` + `/etc/wireplumber` |
-| Arch / CachyOS, user layer | `homeManagerModules.nixaudio` | `~/.config/…`, two `systemd --user` units and a timer |
+| Arch / CachyOS, system layer | `systemManagerModules.nixaudio` | `/etc/pipewire/*.conf.d`, `/etc/wireplumber`, `/etc/nixaudio/fabric.json` |
+| Arch / CachyOS, user layer | `homeManagerModules.nixaudio` | the user services and timer; user config too when it is the only plane |
 
 On Arch the distro's own PipeWire is already running, so the system plane does not install or manage
 the daemons — it drops config where they will read it. Enabling the units belongs to `nixarch`'s
@@ -439,9 +435,17 @@ trees import rather than twice: a value stated in two places is a value that wil
 in two places. The runtime backstop, for a host that got the fact wrong anyway, is the health check's
 listener assertion.
 
-The daemon's own config file is deliberately *not* subject to `dropIns`. It is not a drop-in and
-nothing merges it — whichever plane runs the daemon must place the file that daemon reads, whoever
-owns the PipeWire fragments.
+The daemon's own config file is deliberately *not* subject to `dropIns`. On a two-plane Arch host,
+system-manager already owns the host-level listener and peer facts, so it serialises them once to
+`/etc/nixaudio/fabric.json`; Home Manager sets
+`nixaudio.fabric.daemon.externalConfigPath = "/etc/nixaudio/fabric.json"` and owns only the user
+service lifecycle. It therefore does not repeat `fabric.enable`, `listen.address`, or `peers`, and
+does not generate a second JSON file. When Home Manager is the only plane, leave
+`externalConfigPath` null and it generates `~/.config/nixaudio/fabric.json` as before.
+
+On NixOS, `nixaudio.fabric.daemon.user` is required when the daemon is enabled. That one value now
+drives audio-group membership, lingering, and `ConditionUser` on both the daemon and guard units;
+it is no longer inert metadata consumers must manually act on.
 
 ## The backend
 
@@ -775,8 +779,9 @@ be muted within a week.
 
 The real invariant is relational: *if a peer is reachable **and** offers at least one real device,
 this host must hold a tunnel to it.* That is what `nixaudio.fabric.healthCheck` asserts, naming the
-offending peer when it fails. It registers with `nixwatch` when nixwatch is composed — and nixwatch
-dispatches to nixpush by name, so alerting comes for free and nixaudio never references nixpush.
+offending peer when it fails. When nixwatch is composed, nixaudio registers the probe with a five
+minute interval, ten minute deadline and warning severity. The consumer still supplies the
+`channel`: delivery policy belongs to the operator, and nixaudio never references nixpush.
 
 ### A probe that is not run by the user it reports on
 

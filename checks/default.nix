@@ -39,6 +39,23 @@ let
     };
   };
 
+  # nixwatch remains a soft dependency. This is only the check submodule shape nixaudio fills;
+  # channel is intentionally supplied by the consumer because delivery policy is not audio policy.
+  nixwatchStub = { lib, ... }: {
+    options.nixwatch.checks = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          probe = lib.mkOption { type = lib.types.str; };
+          interval = lib.mkOption { type = lib.types.str; };
+          deadline = lib.mkOption { type = lib.types.str; };
+          severity = lib.mkOption { type = lib.types.str; };
+          channel = lib.mkOption { type = lib.types.str; };
+        };
+      });
+      default = { };
+    };
+  };
+
   # The daemon and monitor modules take `pkgs`, so it has to be threaded through as a specialArg --
   # these are the same real pkgs the flake check runs with, so the packaged daemon and health probe
   # are evaluated for real rather than against a stub that could hide a broken derivation.
@@ -58,11 +75,17 @@ let
       { options.hardware.firmware = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
       { options.systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.systemd.user.timers = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
+      { options.users.users = lib.mkOption { type = lib.types.attrsOf lib.types.unspecified; default = { }; }; }
       { options.security.pam.loginLimits = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; }; }
     ] ++ modules;
   };
 
-  eval = evalPlane nixaudioModule;
+  # A NixOS fabric daemon has to name its user. Keep that ordinary valid default in all the broad
+  # fixtures, and exercise the rejected missing-user shape separately below.
+  eval = modules: evalPlane nixaudioModule ([
+    { nixaudio.fabric.daemon.user = lib.mkDefault "test-user"; }
+  ] ++ modules);
+  evalWithoutDaemonUser = evalPlane nixaudioModule;
 
   # The Arch/system-manager plane, evaluated for real rather than assumed to mirror the NixOS one.
   # It is the plane where the backend is PACKAGES rather than options, so "the same selection
@@ -218,7 +241,7 @@ let
 
   # No fabric at all -- the guard must still be there, because losing the ALSA enumeration has
   # nothing to do with whether this host joins a device pool.
-  backendOnlyGuard = eval [ { nixaudio.backend.enable = true; } ];
+  backendOnlyGuard = eval [{ nixaudio.backend.enable = true; }];
 
   guardOff = eval [
     {
@@ -239,7 +262,7 @@ let
   ];
 
   # A host that genuinely shares its cards with another sound server and must keep the handshake.
-  reserveOn = eval [ { nixaudio.backend.enable = true; nixaudio.guard.reserveDevice = true; } ];
+  reserveOn = eval [{ nixaudio.backend.enable = true; nixaudio.guard.reserveDevice = true; }];
 
   # ── dropIns fixtures: the two-planes-one-host case ──────────────────────────────────────────
   homeSystemDropIns = evalHome [
@@ -247,7 +270,16 @@ let
       nixaudio.fabric.enable = true;
       nixaudio.fabric.listen.address = "203.0.113.14";
       nixaudio.fabric.peers.host-a.host = "host-a";
-      nixaudio.fabric.daemon.user = "alice";
+      nixaudio.dropIns = "system";
+    }
+  ];
+
+  # The normal two-plane Arch shape after system-manager became the single owner of the generated
+  # config. Home Manager knows no listener or peers at all; it only points the service at /etc.
+  homeExternalDaemon = evalHome [
+    {
+      nixaudio.fabric.daemon.enable = true;
+      nixaudio.fabric.daemon.externalConfigPath = "/etc/nixaudio/fabric.json";
       nixaudio.dropIns = "system";
     }
   ];
@@ -383,7 +415,7 @@ let
     { nixiam.posix.deviceGroups.video = 401; nixaudio.rt.enable = true; }
   ];
 
-  rtNoNixiam = eval [ { nixaudio.rt.enable = true; } ];
+  rtNoNixiam = eval [{ nixaudio.rt.enable = true; }];
 
   homePlane = evalHome [
     {
@@ -417,11 +449,11 @@ let
 
   # The backend WITHOUT the fabric: a host that wants its audio declared and joins no device pool.
   # The supported direction of the two options' relationship (the other one is rejected, below).
-  backendOnly = eval [ { nixaudio.backend.enable = true; } ];
+  backendOnly = eval [{ nixaudio.backend.enable = true; }];
 
   # Neither enabled: nothing at all should be published, so a host that has not opted in cannot
   # find backend packages appearing in its own reconciler.
-  backendOff = eval [ { } ];
+  backendOff = eval [{ }];
 
   # The unsupported direction: a fabric with its backend switched off. Rendered config files for
   # daemons nothing installed.
@@ -440,6 +472,24 @@ let
       nixaudio.fabric.enable = true;
       nixaudio.fabric.listen.address = "203.0.113.10";
       nixaudio.fabric.peers.other.host = "host-c";
+    }
+  ];
+
+  missingDaemonUser = evalWithoutDaemonUser [
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.6";
+      nixaudio.fabric.peers.other.host = "host-c";
+    }
+  ];
+
+  monitored = eval [
+    nixwatchStub
+    {
+      nixaudio.fabric.enable = true;
+      nixaudio.fabric.listen.address = "203.0.113.6";
+      nixaudio.fabric.peers.other.host = "host-c";
+      nixwatch.checks.audio-fabric.channel = "operator-alerts";
     }
   ];
 
@@ -716,7 +766,7 @@ let
       name = "state restore is left at WirePlumber's own default unless a host says otherwise";
       ok = !(lib.hasInfix "restore-default-targets" withPriority.config.nixaudio.namingConfig)
         && lib.hasInfix "node.restore-default-targets = false"
-          noRestore.config.nixaudio.namingConfig;
+        noRestore.config.nixaudio.namingConfig;
     }
 
     # ── The guard ─────────────────────────────────────────────────────────────────────────────
@@ -752,7 +802,7 @@ let
       name = "device reservation is disabled by default, in the profile the session actually uses";
       ok = lib.hasInfix "monitor.alsa.reserve-device = disabled"
         composed.config.nixaudio.guard.wireplumberConfig
-        && lib.hasInfix "main =" composed.config.nixaudio.guard.wireplumberConfig;
+      && lib.hasInfix "main =" composed.config.nixaudio.guard.wireplumberConfig;
     }
     {
       name = "a host that needs the reservation handshake can keep it, and gets no fragment";
@@ -785,6 +835,10 @@ let
     {
       name = "the system-manager plane places no drop-in when the user plane owns them";
       ok = !(archUserDropIns.config.environment.etc ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf");
+    }
+    {
+      name = "the system-manager plane owns the generated daemon config";
+      ok = archPlane.config.environment.etc ? "nixaudio/fabric.json";
     }
     {
       name = "evaluates with neither nixusb nor nixnet composed";
@@ -822,6 +876,20 @@ let
       ok = composed.config.systemd.user.services ? fabric-sync;
     }
     {
+      name = "a NixOS daemon without an owner is REJECTED";
+      ok = builtins.length (failed missingDaemonUser) == 1;
+    }
+    {
+      name = "the NixOS daemon owner gets device access and lingering";
+      ok = lib.elem "audio" composed.config.users.users.test-user.extraGroups
+        && composed.config.users.users.test-user.linger;
+    }
+    {
+      name = "the NixOS daemon and guard are fenced to the declared user";
+      ok = composed.config.systemd.user.services.fabric-sync.unitConfig.ConditionUser == "test-user"
+        && composed.config.systemd.user.services.nixaudio-alsa-guard.unitConfig.ConditionUser == "test-user";
+    }
+    {
       name = "the health probe is available even without nixwatch composed";
       ok = standalone.config.nixaudio.fabric.healthCheck != null;
     }
@@ -829,6 +897,12 @@ let
       name = "no nixwatch check is registered when nixwatch is absent";
       # Defining an option that does not exist is an eval error, so the guard has to hold.
       ok = !(standalone.config ? nixwatch);
+    }
+    {
+      name = "nixwatch gets a two-tick deadline without claiming the operator's channel";
+      ok = monitored.config.nixwatch.checks.audio-fabric.deadline == "10m"
+        && monitored.config.nixwatch.checks.audio-fabric.interval == "5m"
+        && monitored.config.nixwatch.checks.audio-fabric.channel == "operator-alerts";
     }
     {
       name = "the catalogue lists this host's own devices under their bare stable name";
@@ -876,9 +950,10 @@ let
         let
           countPeerEntries = c:
             builtins.length (lib.attrNames (lib.filterAttrs (_: v: v.origin == "peer") (catalogue c)));
-        in countPeerEntries composed == 2 * 2
-          && countPeerEntries manyPeers == 3 * 2
-          && (catalogue manyPeers) ? "host-c.shure";
+        in
+        countPeerEntries composed == 2 * 2
+        && countPeerEntries manyPeers == 3 * 2
+        && (catalogue manyPeers) ? "host-c.shure";
     }
     {
       name = "a local device name colliding with a <peer>.<device> key is REJECTED";
@@ -936,6 +1011,14 @@ let
       ok = builtins.any
         (e: lib.hasInfix "NIXAUDIO_FABRIC_CONFIG=/home/test/.config/nixaudio/fabric.json" e)
         homePlane.config.systemd.user.services.fabric-sync.Service.Environment;
+    }
+    {
+      name = "the home plane can run only the daemon against system-manager's config";
+      ok = (homeExternalDaemon.config.systemd.user.services ? fabric-sync)
+        && !(homeExternalDaemon.config.xdg.configFile ? "nixaudio/fabric.json")
+        && builtins.any
+        (e: e == "NIXAUDIO_FABRIC_CONFIG=/etc/nixaudio/fabric.json")
+        homeExternalDaemon.config.systemd.user.services.fabric-sync.Service.Environment;
     }
 
     # ── The backend: the universal set ────────────────────────────────────────────────────────
@@ -1000,7 +1083,8 @@ let
         let
           off = lib.sort (a: b: a < b) archPlane.config.nixaudio.backend.archPackages;
           on = lib.sort (a: b: a < b) archPlaneSof.config.nixaudio.backend.archPackages;
-        in lib.subtractLists off on == [ "sof-firmware" ] && lib.subtractLists on off == [ ];
+        in
+        lib.subtractLists off on == [ "sof-firmware" ] && lib.subtractLists on off == [ ];
     }
     {
       name = "firmware is delivered as firmware, never as a package on PATH";
@@ -1020,8 +1104,9 @@ let
         let
           declared = lib.unique (lib.filter (g: g != null) (map (e: e.gate or null) backendEntries));
           answered = lib.attrNames archPlane.config.nixaudio.backend.hardwareGates;
-        in lib.sort (a: b: a < b) declared == lib.sort (a: b: a < b) answered
-          && declared != [ ];
+        in
+        lib.sort (a: b: a < b) declared == lib.sort (a: b: a < b) answered
+        && declared != [ ];
     }
 
     # ── The plane divide: what NixOS's own options provide, and must not be installed twice ────
@@ -1046,9 +1131,10 @@ let
         let
           b = composed.config.nixaudio.backend;
           provided = lib.attrNames b.providedByNixosOptions;
-        in lib.intersectLists provided (b.packageNames ++ b.firmwareNames) == [ ]
-          # ...and the same again at the entry level, where the table could break it
-          && resolve.shadowed backendEntries == [ ];
+        in
+        lib.intersectLists provided (b.packageNames ++ b.firmwareNames) == [ ]
+        # ...and the same again at the entry level, where the table could break it
+        && resolve.shadowed backendEntries == [ ];
     }
     {
       name = "an entry naming BOTH a nixpkgs attribute and a NixOS option is caught, not merged";

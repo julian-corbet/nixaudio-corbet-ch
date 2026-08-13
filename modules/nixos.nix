@@ -10,6 +10,29 @@ in
     # one. See ./dropins.nix for what happens when both write.
     { nixaudio.dropIns = lib.mkDefault "system"; }
 
+    {
+      assertions = lib.optional (cfg.fabric.enable && cfg.fabric.daemon.enable) {
+        assertion = cfg.fabric.daemon.user != null;
+        message = ''
+          nixaudio.fabric.daemon.user must name the NixOS user whose PipeWire graph fabric-sync
+          manages when the daemon is enabled.
+        '';
+      };
+    }
+
+    # NixOS installs user units into every user's manager. State the intended owner once and use it
+    # for all three mechanisms that make a headless audio session reliable: device access, lingering
+    # and ConditionUser fences on both fabric-sync and the ALSA guard.
+    (lib.mkIf
+      (cfg.fabric.enable && cfg.fabric.daemon.enable && cfg.fabric.daemon.user != null)
+      {
+        users.users.${cfg.fabric.daemon.user} = {
+          extraGroups = [ "audio" ];
+          linger = true;
+        };
+        nixaudio.guard.user = lib.mkDefault cfg.fabric.daemon.user;
+      })
+
     # ── The guard is gated on ITSELF, not on the fabric ───────────────────────────────────────
     # A host can declare its audio backend without joining any device pool (that is exactly what
     # `backend.enable` without `fabric.enable` means), and such a host loses its ALSA enumeration
@@ -86,45 +109,50 @@ in
     })
 
     (lib.mkIf cfg.fabric.enable {
-    services.pipewire = {
-      enable = lib.mkDefault true;
-      alsa.enable = lib.mkDefault true;
-      # pipewire-pulse is not optional for this module: it hosts the listener peers connect to and
-      # is what `pactl` (and therefore the mirroring daemon) talks to.
-      pulse.enable = true;
+      services.pipewire = {
+        enable = lib.mkDefault true;
+        alsa.enable = lib.mkDefault true;
+        # pipewire-pulse is not optional for this module: it hosts the listener peers connect to and
+        # is what `pactl` (and therefore the mirroring daemon) talks to.
+        pulse.enable = true;
 
-      extraConfig.pipewire = cfg.fabric.pipewireConfig;
-      extraConfig.pipewire-pulse = cfg.fabric.pulseConfig;
-    };
+        extraConfig.pipewire = cfg.fabric.pipewireConfig;
+        extraConfig.pipewire-pulse = cfg.fabric.pulseConfig;
+      };
 
-    # WirePlumber rules go through /etc rather than services.pipewire.wireplumber.configPackages so
-    # that the exact same rendered text is used on both planes -- a system-manager host has no
-    # configPackages equivalent, and one rendering is easier to reason about than two.
-    environment.etc = lib.optionalAttrs (cfg.dropIns == "system") {
-      "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-    }
-    // lib.optionalAttrs cfg.fabric.daemon.enable {
-      "nixaudio/fabric.json".source = cfg.fabric.daemon.configFile;
-    };
+      # WirePlumber rules go through /etc rather than services.pipewire.wireplumber.configPackages so
+      # that the exact same rendered text is used on both planes -- a system-manager host has no
+      # configPackages equivalent, and one rendering is easier to reason about than two.
+      environment.etc = lib.optionalAttrs (cfg.dropIns == "system")
+        {
+          "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
+        }
+      // lib.optionalAttrs cfg.fabric.daemon.enable {
+        "nixaudio/fabric.json".source = cfg.fabric.daemon.configFile;
+      };
 
-    systemd.user.services = lib.mkIf cfg.fabric.daemon.enable {
-      fabric-sync = {
-        description = "Audio fabric device mirror (nixaudio)";
-        # Wants, not Requires: pipewire-pulse is socket-activated, and the daemon's own self-heal
-        # handles a pulse that goes away later. A hard Requires would take the daemon down with it.
-        after = [ "pipewire-pulse.service" ];
-        wants = [ "pipewire-pulse.service" ];
-        wantedBy = [ "default.target" ];
+      systemd.user.services = lib.mkIf cfg.fabric.daemon.enable {
+        fabric-sync = {
+          description = "Audio fabric device mirror (nixaudio)";
+          # Wants, not Requires: pipewire-pulse is socket-activated, and the daemon's own self-heal
+          # handles a pulse that goes away later. A hard Requires would take the daemon down with it.
+          after = [ "pipewire-pulse.service" ];
+          wants = [ "pipewire-pulse.service" ];
+          wantedBy = [ "default.target" ];
 
-        environment.NIXAUDIO_FABRIC_CONFIG = "/etc/nixaudio/fabric.json";
+          environment.NIXAUDIO_FABRIC_CONFIG = "/etc/nixaudio/fabric.json";
 
-        serviceConfig = {
-          ExecStart = "${cfg.fabric.daemon.package}/bin/fabric-sync";
-          Restart = "always";
-          RestartSec = 5;
+          unitConfig = lib.optionalAttrs (cfg.fabric.daemon.user != null) {
+            ConditionUser = cfg.fabric.daemon.user;
+          };
+
+          serviceConfig = {
+            ExecStart = "${cfg.fabric.daemon.package}/bin/fabric-sync";
+            Restart = "always";
+            RestartSec = 5;
+          };
         };
       };
-    };
     })
   ];
 }

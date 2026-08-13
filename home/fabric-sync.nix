@@ -32,6 +32,10 @@ let
   # needs to know which plane placed the file.
   configRelPath = "nixaudio/fabric.json";
   configAbsPath = "${config.xdg.configHome}/${configRelPath}";
+  daemonConfigPath =
+    if cfg.fabric.daemon.externalConfigPath == null
+    then configAbsPath
+    else cfg.fabric.daemon.externalConfigPath;
 in
 {
   imports = [
@@ -42,6 +46,19 @@ in
     ../modules/daemon.nix
     ../modules/guard.nix
   ];
+
+  options.nixaudio.fabric.daemon.externalConfigPath = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    example = "/etc/nixaudio/fabric.json";
+    description = ''
+      Existing daemon configuration to use instead of generating a second Home Manager copy.
+
+      This is intended for an Arch host that composes the system-manager plane as the authority for
+      host-level fabric facts and Home Manager only to run the user service. Leave it null when Home
+      Manager is the only nixaudio plane; it will generate its own XDG configuration as before.
+    '';
+  };
 
   config = lib.mkMerge [
     # This plane writes the user's own XDG config, so on a host where it is the ONLY nixaudio plane
@@ -109,49 +126,52 @@ in
     })
 
     (lib.mkIf cfg.fabric.enable {
-    xdg.configFile =
-      # The PipeWire/WirePlumber drop-ins, only when this plane owns them. Both read from the user's
-      # XDG config dir, which takes precedence over the distro's own /usr/share defaults without
-      # modifying anything pacman owns.
-      lib.optionalAttrs (cfg.dropIns == "user") {
-        "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf".text =
-          builtins.toJSON cfg.fabric.pipewireConfig."50-fabric-loops";
+      xdg.configFile =
+        # The PipeWire/WirePlumber drop-ins, only when this plane owns them. Both read from the user's
+        # XDG config dir, which takes precedence over the distro's own /usr/share defaults without
+        # modifying anything pacman owns.
+        lib.optionalAttrs (cfg.dropIns == "user") {
+          "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf".text =
+            builtins.toJSON cfg.fabric.pipewireConfig."50-fabric-loops";
 
-        "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf".text =
-          builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
+          "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf".text =
+            builtins.toJSON cfg.fabric.pulseConfig."50-fabric-listener";
 
-        "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
-      }
-      # The daemon's OWN config file is not a drop-in and is not subject to `dropIns`: this plane
-      # runs the daemon, so this plane must place the file that daemon reads, whichever plane owns
-      # the PipeWire fragments.
-      // lib.optionalAttrs cfg.fabric.daemon.enable {
+          "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
+        };
+    })
+
+    # The service is intentionally gated on daemon.enable rather than fabric.enable. With an
+    # external config, Home Manager does not need to duplicate the host's listener or peer facts at
+    # all; it owns only the user-service lifecycle while system-manager owns /etc.
+    (lib.mkIf cfg.fabric.daemon.enable {
+      xdg.configFile = lib.optionalAttrs (cfg.fabric.daemon.externalConfigPath == null) {
         ${configRelPath}.source = cfg.fabric.daemon.configFile;
       };
 
-    systemd.user.services = lib.mkIf cfg.fabric.daemon.enable {
-      fabric-sync = {
-        Unit = {
-          Description = "Audio fabric device mirror (nixaudio)";
-          # Wants rather than Requires: pipewire-pulse is socket-activated, and the daemon's own
-          # self-heal path handles a pulse that disappears later. A hard Requires would drag the
-          # daemon down with it and defeat that recovery.
-          After = [ "pipewire-pulse.service" ];
-          Wants = [ "pipewire-pulse.service" ];
-        };
+      systemd.user.services = {
+        fabric-sync = {
+          Unit = {
+            Description = "Audio fabric device mirror (nixaudio)";
+            # Wants rather than Requires: pipewire-pulse is socket-activated, and the daemon's own
+            # self-heal path handles a pulse that disappears later. A hard Requires would drag the
+            # daemon down with it and defeat that recovery.
+            After = [ "pipewire-pulse.service" ];
+            Wants = [ "pipewire-pulse.service" ];
+          };
 
-        Service = {
-          Environment = [ "NIXAUDIO_FABRIC_CONFIG=${configAbsPath}" ];
-          ExecStart = "${cfg.fabric.daemon.package}/bin/fabric-sync";
-          Restart = "always";
-          RestartSec = 5;
-        };
+          Service = {
+            Environment = [ "NIXAUDIO_FABRIC_CONFIG=${daemonConfigPath}" ];
+            ExecStart = "${cfg.fabric.daemon.package}/bin/fabric-sync";
+            Restart = "always";
+            RestartSec = 5;
+          };
 
-        # default.target, not graphical-session.target: the daemon has no compositor dependency, and
-        # a headless node with lingering enabled must still join the fabric with no session at all.
-        Install.WantedBy = [ "default.target" ];
+          # default.target, not graphical-session.target: the daemon has no compositor dependency, and
+          # a headless node with lingering enabled must still join the fabric with no session at all.
+          Install.WantedBy = [ "default.target" ];
+        };
       };
-    };
     })
   ];
 }

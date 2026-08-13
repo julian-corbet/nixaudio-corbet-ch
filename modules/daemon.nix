@@ -85,15 +85,18 @@ in
     };
 
     user = lib.mkOption {
-      type = lib.types.str;
+      type = lib.types.nullOr lib.types.str;
+      default = null;
       example = "alice";
       description = ''
-        The user whose PipeWire graph the daemon manages.
+        The user whose PipeWire graph the daemon manages on NixOS.
 
         This is a user service, not a system one, because the audio graph belongs to a user session —
         there is no system-wide PipeWire to attach to. On a headless node the user needs lingering
         enabled so its user manager (and therefore PipeWire and this daemon) starts at boot with no
-        login session.
+        login session. The NixOS projection requires this when the daemon is enabled, adds the user
+        to the audio group, enables lingering and fences the unit with ConditionUser. Home Manager
+        already scopes the unit to exactly one user, so its projection does not need this value.
       '';
     };
 

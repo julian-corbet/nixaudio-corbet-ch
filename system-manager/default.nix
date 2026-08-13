@@ -90,5 +90,12 @@ in
         "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf".text = cfg.namingConfig;
       };
     })
+
+    # system-manager owns the host-level fabric facts on Arch: the listener address and peer table
+    # are already declared in this tree, so serialise them once into /etc. Home Manager can then run
+    # the user service against this file without repeating either value in its separate evaluation.
+    (lib.mkIf (cfg.fabric.enable && cfg.fabric.daemon.enable) {
+      environment.etc."nixaudio/fabric.json".source = cfg.fabric.daemon.configFile;
+    })
   ];
 }

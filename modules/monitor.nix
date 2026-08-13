@@ -176,6 +176,9 @@ in
       nixwatch.checks.audio-fabric = {
         probe = "${cfg.healthCheck}/bin/nixaudio-fabric-health";
         interval = lib.mkDefault "5m";
+        # Two ticks: one transient miss does not page, while a sustained broken mirror does. The
+        # dispatch channel remains an operator value and must be supplied by the consumer.
+        deadline = lib.mkDefault "10m";
         severity = lib.mkDefault "warning";
       };
     }))
