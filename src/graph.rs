@@ -458,7 +458,10 @@ impl Graph {
             } else {
                 &node.application_id
             };
-            let intent_key = format!("{}|{}|{}", app_key, node.media_role, node.media_name);
+            // Keyed on who is playing and in what capacity -- never on `media.name`, which is the
+            // per-track title ("Pink Floyd: Time" is PipeWire's own example for it). A route the
+            // user pinned belongs to "Firefox - video", not to the video that was open at the time.
+            let intent_key = format!("{}|{}", app_key, node.media_role);
             let targets: BTreeSet<String> = links
                 .iter()
                 .filter(|link| link.output_node == node.id)
@@ -897,7 +900,7 @@ mod tests {
         fabric::{ChannelSlice, Manifest, PeerSnapshot, Role, SessionPlan},
     };
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn config() -> Config {
         Config {
@@ -1032,5 +1035,61 @@ mod tests {
             .unwrap();
         assert!(output.available);
         assert_eq!(graph.snapshot.streams[0].targets, ["beta.hyperx"]);
+    }
+
+    /// `media.name` is PipeWire's per-track title -- its own keys.h offers "Pink Floyd: Time" as
+    /// the example. A remembered route keyed on it stops matching at the next track, and because an
+    /// empty explicit target set falls back to the default output, the stream is actively dragged
+    /// off the device the user pinned it to, mid-playback. The route belongs to the application and
+    /// its role, which is exactly what the tray shows: "Firefox - video".
+    #[test]
+    fn a_remembered_route_survives_a_change_of_track() {
+        let playing = |title: &str| {
+            vec![
+                json!({"id": 10, "type": "PipeWire:Interface:Node", "info": {"props": {
+                    "object.serial": 100, "node.name": "alsa_output.usb-hyperx",
+                    "node.description": "HyperX", "media.class": "Audio/Sink",
+                    "alsa.nixaudio.device": "hyperx", "device.profile.name": "analog-stereo"
+                }}}),
+                port(11, 10, "playback_FL", "in", "FL"),
+                port(12, 10, "playback_FR", "in", "FR"),
+                json!({"id": 20, "type": "PipeWire:Interface:Node", "info": {"props": {
+                    "object.serial": 200, "node.name": "Firefox", "media.name": title,
+                    "media.class": "Stream/Output/Audio", "application.name": "Firefox",
+                    "application.process.binary": "firefox", "media.role": "Music"
+                }}}),
+                port(21, 20, "output_FL", "out", "FL"),
+            ]
+        };
+
+        let first = Graph::from_values(
+            &playing("Pink Floyd: Time"),
+            &config(),
+            &State::default(),
+            &FabricSnapshot::default(),
+            1,
+        )
+        .unwrap();
+        let pinned = first.snapshot.streams[0].intent_key.clone();
+
+        let mut state = State::default();
+        state.routes.insert(
+            pinned,
+            BTreeSet::from(["local.hyperx.analog-stereo".into()]),
+        );
+
+        let next = Graph::from_values(
+            &playing("Pink Floyd: Money"),
+            &config(),
+            &state,
+            &FabricSnapshot::default(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            next.snapshot.streams[0].explicit_targets,
+            ["local.hyperx.analog-stereo"],
+            "the route was pinned to the application, not to the track that happened to be playing"
+        );
     }
 }
