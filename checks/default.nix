@@ -105,6 +105,19 @@ in
     ]
   );
 
+  # NixOS renders `path` as an exclusive Environment=PATH, so anything the daemon shells out to and
+  # cannot find is a dead D-Bus method rather than a build error. The daemon runs `timeout` and
+  # `pw-dump`/`pw-link` (graph.rs:207,727,763,796) and `wpctl` (graph.rs:842,858,871) -- and wpctl
+  # ships in wireplumber, not pipewire, which is exactly the kind of split a unit test cannot see.
+  daemon-tooling = check "daemon-tooling" (
+    let
+      path = nixos.config.systemd.user.services.nixaudiod.path;
+    in
+    builtins.elem pkgs.coreutils path
+    && builtins.elem pkgs.pipewire path
+    && builtins.elem pkgs.wireplumber path
+  );
+
   pipewire-boundary = check "pipewire-boundary" (
     nixos.config.services.pipewire.jack.enable
     && !(nixos.config.services.pipewire ? extraConfig)
