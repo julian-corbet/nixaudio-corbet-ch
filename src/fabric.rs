@@ -287,53 +287,25 @@ async fn fetch(peer: &PeerConfig) -> Result<(String, Manifest)> {
 impl Runtime {
     pub async fn reconcile(&mut self, config: &Config, local: &Manifest) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
-        let mut wanted = BTreeSet::new();
         for (name, peer) in &config.peers {
-            let (address, remote) = match fetch(peer).await {
-                Ok(value) => value,
-                Err(error) => {
-                    eprintln!("nixaudiod: peer {name}: {error:#}");
-                    continue;
+            // A peer's own failure costs that peer and nothing else. Returning early here would
+            // starve every peer sorted after it -- `peers` is a BTreeMap, so the same ones every
+            // pass -- and skip the reaping below, leaking a worker for every peer ever removed.
+            match self.reconcile_peer(config, local, name, peer).await {
+                Ok(entry) => {
+                    snapshot.peers.insert(name.clone(), entry);
                 }
-            };
-            let plan = plan(
-                &config.node,
-                name,
-                &address,
-                peer.audio_port,
-                local,
-                &remote,
-            )?;
-            let spec = worker_spec(&plan, &config.transport);
-            wanted.insert(name.clone());
-
-            let restart = match self.workers.get_mut(name) {
-                Some(worker) if worker.spec == spec => worker.child.try_wait()?.is_some(),
-                Some(worker) => {
-                    let _ = worker.child.kill().await;
-                    let _ = worker.child.wait().await;
-                    true
-                }
-                None => true,
-            };
-            if restart {
-                let child = spawn_worker(&spec)?;
-                self.workers.insert(name.clone(), Worker { spec, child });
+                Err(error) => eprintln!("nixaudiod: peer {name}: {error:#}"),
             }
-            snapshot.peers.insert(
-                name.clone(),
-                PeerSnapshot {
-                    address,
-                    manifest: remote,
-                    plan,
-                },
-            );
         }
 
+        // Staleness is a question about configuration, not about this pass. A peer whose control
+        // endpoint blinked is still a peer we carry audio for; tearing its session down over one
+        // unanswered manifest would turn a control-plane blip into an audible dropout.
         let stale: Vec<String> = self
             .workers
             .keys()
-            .filter(|name| !wanted.contains(*name))
+            .filter(|name| !config.peers.contains_key(*name))
             .cloned()
             .collect();
         for name in stale {
@@ -343,6 +315,44 @@ impl Runtime {
             }
         }
         Ok(snapshot)
+    }
+
+    async fn reconcile_peer(
+        &mut self,
+        config: &Config,
+        local: &Manifest,
+        name: &str,
+        peer: &PeerConfig,
+    ) -> Result<PeerSnapshot> {
+        let (address, remote) = fetch(peer).await?;
+        let plan = plan(
+            &config.node,
+            name,
+            &address,
+            peer.audio_port,
+            local,
+            &remote,
+        )?;
+        let spec = worker_spec(&plan, &config.transport);
+
+        let restart = match self.workers.get_mut(name) {
+            Some(worker) if worker.spec == spec => worker.child.try_wait()?.is_some(),
+            Some(worker) => {
+                let _ = worker.child.kill().await;
+                let _ = worker.child.wait().await;
+                true
+            }
+            None => true,
+        };
+        if restart {
+            let child = spawn_worker(&spec)?;
+            self.workers.insert(name.to_owned(), Worker { spec, child });
+        }
+        Ok(PeerSnapshot {
+            address,
+            manifest: remote,
+            plan,
+        })
     }
 }
 
@@ -383,6 +393,7 @@ pub async fn serve(config: Config, manifest: Arc<RwLock<Manifest>>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ControlConfig;
 
     fn endpoint(id: &str, channels: &[&str]) -> EndpointManifest {
         EndpointManifest {
@@ -485,5 +496,146 @@ mod tests {
         let received = fetch_at("127.0.0.1", address.port()).await.unwrap();
         task.await.unwrap();
         assert_eq!(received, manifest);
+    }
+
+    /// A peer that answers but is not who we expect is what a half-finished rollout looks like on
+    /// the wire: both ends up, one of them still on the other revision. That must cost us that one
+    /// peer and nothing else. `config.peers` is a BTreeMap, so returning early deterministically
+    /// starves every peer sorted after the failing one, and skips stale-worker reaping entirely --
+    /// which leaks a JackTrip child for every peer ever removed from the configuration.
+    #[tokio::test]
+    async fn one_unplannable_peer_costs_only_that_peer() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_port = listener.local_addr().unwrap().port();
+        let published = Arc::new(RwLock::new(Manifest {
+            protocol: 1,
+            node: "somebody-else".into(),
+            revision: 1,
+            outputs: vec![endpoint("local.speakers", &["FL", "FR"])],
+            inputs: Vec::new(),
+        }));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = serve_connection(stream, published.clone()).await;
+            }
+        });
+
+        let mut config = Config {
+            node: "alpha".into(),
+            control: ControlConfig::default(),
+            transport: TransportConfig::default(),
+            peers: BTreeMap::new(),
+            catalogue: BTreeMap::new(),
+        };
+        config.peers.insert(
+            "beta".into(),
+            PeerConfig {
+                addresses: vec!["127.0.0.1".into()],
+                control_port,
+                audio_port: 46001,
+            },
+        );
+        let local = Manifest {
+            protocol: 1,
+            node: "alpha".into(),
+            revision: 1,
+            outputs: vec![endpoint("local.speakers", &["FL", "FR"])],
+            inputs: Vec::new(),
+        };
+
+        let mut runtime = Runtime::default();
+        runtime.workers.insert(
+            "gamma".into(),
+            Worker {
+                spec: WorkerSpec {
+                    command: vec!["true".into()],
+                    arguments: Vec::new(),
+                    latency: "128/48000".into(),
+                },
+                child: Command::new("sleep")
+                    .arg("30")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            },
+        );
+
+        let snapshot = runtime
+            .reconcile(&config, &local)
+            .await
+            .expect("an unplannable peer must not abort the whole reconcile pass");
+
+        assert!(
+            snapshot.peers.is_empty(),
+            "the rejected peer must not appear in the snapshot"
+        );
+        assert!(
+            !runtime.workers.contains_key("gamma"),
+            "a peer removed from the configuration must still be reaped when an earlier peer fails"
+        );
+    }
+
+    /// A control endpoint that blinks is not a reason to drop audio that is already flowing. The
+    /// reaper answers a question about configuration -- is this peer still declared? -- not about
+    /// whether this particular pass happened to reach it.
+    #[tokio::test]
+    async fn a_configured_peer_that_fails_this_pass_keeps_its_session() {
+        // Bind then drop, so the port is real, free, and certain to refuse.
+        let closed = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_port = closed.local_addr().unwrap().port();
+        drop(closed);
+
+        let mut config = Config {
+            node: "alpha".into(),
+            control: ControlConfig::default(),
+            transport: TransportConfig::default(),
+            peers: BTreeMap::new(),
+            catalogue: BTreeMap::new(),
+        };
+        config.peers.insert(
+            "beta".into(),
+            PeerConfig {
+                addresses: vec!["127.0.0.1".into()],
+                control_port,
+                audio_port: 46001,
+            },
+        );
+        let local = Manifest {
+            protocol: 1,
+            node: "alpha".into(),
+            revision: 1,
+            outputs: vec![endpoint("local.speakers", &["FL", "FR"])],
+            inputs: Vec::new(),
+        };
+
+        let mut runtime = Runtime::default();
+        runtime.workers.insert(
+            "beta".into(),
+            Worker {
+                spec: WorkerSpec {
+                    command: vec!["true".into()],
+                    arguments: Vec::new(),
+                    latency: "128/48000".into(),
+                },
+                child: Command::new("sleep")
+                    .arg("30")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            },
+        );
+
+        runtime.reconcile(&config, &local).await.unwrap();
+
+        let worker = runtime
+            .workers
+            .get_mut("beta")
+            .expect("a declared peer keeps its session across an unanswered manifest");
+        assert!(
+            worker.child.try_wait().unwrap().is_none(),
+            "the running JackTrip session must not have been killed"
+        );
     }
 }
