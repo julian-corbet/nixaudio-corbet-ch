@@ -70,6 +70,19 @@ A circle is a handful of ordinary computers on ordinary Internet connections, mo
 overlay network, VPN or static addressing may be assumed — where one exists it is a convenience for
 that operator, never a prerequisite the design leans on.
 
+**Members move.** A laptop that is on the LAN in the morning and on a hotspot in the afternoon is
+the ordinary case, not the exception. Membership is an identity, so leaving the network changes the
+path and nothing else: the same peer, the same semantic outputs, the same remembered routes.
+
+**nixaudio carries its own audio, and never borrows a general-purpose tunnel.** Where an operator
+already runs an overlay, it is tempting to route audio over it and call the transport problem
+solved. That is the wrong boundary in both directions. A shared tunnel usually carries bulk traffic
+— file shares, backups — and a large transfer starves a 2.7 ms audio packet in a way no jitter
+buffer should have to absorb; a userspace overlay also concentrates every peer's traffic on one
+core. And it couples liveness: the overlay going down would take the audio with it, for a reason
+that has nothing to do with audio. So audio gets its own path, and an overlay is neither a
+dependency nor, where it can be avoided, even a route.
+
 ## Stated future, not a current goal
 
 A native Rust transport, replacing the supervised JackTrip process, is wanted eventually. It is not
