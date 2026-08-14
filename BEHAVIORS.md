@@ -43,10 +43,15 @@ Each of these is a deliberate exclusion, not an omission awaiting a contributor.
 
 **Upstream JackTrip does the hard real-time work, and we do not fork it.** It already owns the
 low-latency UDP, jitter buffering, packet redundancy and multichannel layout. nixaudio pins an
-upstream source build and supervises the process; it does not vendor, port or link its code. This is
-what keeps nixaudio MIT — JackTrip is mixed MIT/GPL/LGPL, and an arms-length process boundary is the
-arrangement that keeps the licences separate. Reading it for design knowledge is free; copying it is
-not.
+upstream source build and supervises the process; it does not vendor, port or link its code.
+
+The reason is engineering, not licence. Everything load-bearing in JackTrip is MIT — its GPL surface
+is the Qt GUI, which the headless build excludes — so vendoring would be permitted. But its data
+protocol calls back into the JackTrip mediator across twenty-one methods, so a faithful lift drags
+several thousand lines of Qt-typed C++ along with it and forks the wire format, in exchange for a
+chokepoint that is the easy part of the problem. Reading it is free and encouraged; copying it buys
+very little and costs a fork forever. There is also no library to link against: upstream builds a
+single executable and declares no library target.
 
 **PipeWire owns each host's local graph.** Devices, streams, ports, mixing and local policy are its
 job. nixaudio never becomes a second media graph.
