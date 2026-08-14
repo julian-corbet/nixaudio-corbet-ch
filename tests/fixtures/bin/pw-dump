@@ -1,0 +1,22 @@
+#!/bin/sh
+# Fake PipeWire graph source.
+#
+# Without --monitor: print the graph the test has staged. nixaudiod reaches this through
+# `timeout --kill-after=1s 6s pw-dump`, and timeout execs through PATH, so putting this
+# directory first is enough to intercept it.
+#
+# With --monitor: nixaudiod reads this stream only to learn that *something* changed
+# (bin/nixaudiod.rs treats any bytes at all as one refresh event). Following an events file
+# means a test injects a graph change by appending a line to it -- no polling, no sleeps.
+set -eu
+
+if [ "${1:-}" = "--monitor" ]; then
+    # Real pw-dump --monitor dumps the current graph before it starts following, so the daemon
+    # gets one event as soon as it subscribes. Reproducing that matters: without it the daemon
+    # would sit on its startup snapshot until something else moved, and every test would have to
+    # nudge it by hand for a reason that has nothing to do with what it was testing.
+    cat "$NIXAUDIO_FAKE_GRAPH"
+    exec tail -n 0 -f "$NIXAUDIO_FAKE_EVENTS"
+fi
+
+exec cat "$NIXAUDIO_FAKE_GRAPH"

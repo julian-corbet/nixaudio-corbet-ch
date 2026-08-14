@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+# A push to a branch with an open pull request fires both triggers. Without this the second run
+# spends its minutes re-proving exactly what the first one is proving.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # JackTrip 3.0.0 is a source build with Qt behind it, and cache.nixos.org has no copy of this
+    # derivation because its meson flags differ from the nixpkgs one.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Two commands, because `checks` here holds real derivations as well as evaluation
+      # assertions, and no single invocation covers both honestly.
+      #
+      # A bare `nix flake check` evaluates only the RUNNER's system and prints "omitted these
+      # incompatible systems" as a warning before exiting 0 -- green having tested nothing on every
+      # other platform this flake declares. That is the failure the nix* family exists to prevent,
+      # so evaluation is strict across all of them.
+      #
+      # But `--all-systems` on its own cannot be the whole story either: checks.rust and
+      # checks.jacktrip are real builds, so building the aarch64 ones on an x86_64 runner would
+      # fail on platform mismatch rather than on anything about this repository. Hence --no-build
+      # for the strict pass, and a second unrestricted pass that genuinely compiles the crate and
+      # runs its unit and integration tests on the system the runner can actually build for.
+      - name: evaluate every declared system
+        run: nix flake check --all-systems --no-build
+
+      - name: build and test
+        run: nix flake check --print-build-logs

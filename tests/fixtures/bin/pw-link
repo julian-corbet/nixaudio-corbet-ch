@@ -1,0 +1,5 @@
+#!/bin/sh
+# Records the exact argv nixaudiod used to link or unlink two PipeWire ports, so a test can
+# assert on the real command rather than on an internal call it mocked out.
+set -eu
+printf 'pw-link %s\n' "$*" >>"$NIXAUDIO_FAKE_LOG"

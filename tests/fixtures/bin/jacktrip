@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stands in for a JackTrip session. Reached through `transport.command` in the config rather
+# than through PATH, so a test points at it by writing one config field.
+#
+# It records its argv and the latency hint it was handed, then lives until killed -- a JackTrip
+# worker that exits immediately would look to the supervisor like a crash, and every restart
+# test would pass for the wrong reason.
+set -eu
+printf 'jacktrip %s\n' "$*" >>"$NIXAUDIO_FAKE_LOG"
+printf 'jacktrip-env PIPEWIRE_LATENCY=%s\n' "${PIPEWIRE_LATENCY:-unset}" >>"$NIXAUDIO_FAKE_LOG"
+exec sleep 3600

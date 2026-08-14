@@ -1,0 +1,6 @@
+#!/bin/sh
+# Records default/volume/mute calls. These are the four methods that were dead on NixOS until
+# wireplumber joined the unit's PATH, which is precisely the class of failure a fake that
+# records real argv can catch and an internal mock cannot.
+set -eu
+printf 'wpctl %s\n' "$*" >>"$NIXAUDIO_FAKE_LOG"

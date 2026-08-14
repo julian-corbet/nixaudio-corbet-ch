@@ -5,6 +5,11 @@ pkgs.rustPlatform.buildRustPackage {
   src = ./.;
   cargoLock.lockFile = ./Cargo.lock;
 
+  # tests/daemon.rs starts a real nixaudiod on a private session bus, so the sandbox needs a
+  # dbus-daemon. Everything else those tests reach for -- the fake pw-dump, pw-link, wpctl and
+  # jacktrip -- is a shell script in tests/fixtures/bin, and `timeout` comes from stdenv.
+  nativeCheckInputs = [ pkgs.dbus ];
+
   # These programs deliberately remain unwrapped. On Arch they must talk to the distro's running
   # PipeWire with the distro's pw-dump/wpctl/pw-link/pactl. The service planes provide their PATH;
   # baking a second nixpkgs PipeWire into this package would create the split-brain install the
