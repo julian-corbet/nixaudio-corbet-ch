@@ -579,3 +579,56 @@ fn a_daemon_that_cannot_read_the_graph_at_startup_starts_anyway_and_recovers() {
         "with no restart and nobody intervening"
     );
 }
+
+/// A circle must be unconstructible, not merely absent.
+///
+/// PipeWire marks a node that pipes audio off the machine with `node.network`. Treating one as a
+/// local device made nixaudio tell its peers "this host has an output called X" — untrue, X is a
+/// pipe back out. A peer believed it, sent audio for X, our JackTrip delivered it, and the pipe
+/// forwarded it straight back. Measured at 9.35 Mbit/s on the wire the real audio shares.
+///
+/// Excluding such a node means no combination of routes can build the loop: it is neither
+/// advertised to a peer nor selectable here.
+#[test]
+fn a_network_pipe_is_not_an_output_on_this_machine() {
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph.as_array_mut().unwrap().extend([
+        // A tunnel to another host, exactly as the retired Pulse mesh left them.
+        json!({"id": 60, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "object.serial": 600, "node.name": "fabric_6_deadbeef",
+            "node.description": "Tunnel to tcp:192.168.42.6:4713/whatever",
+            "media.class": "Audio/Sink", "node.network": true, "node.virtual": true
+        }}}),
+        port(61, 60, "playback_FL", "in", "FL"),
+        // A Bluetooth headset: reached over a radio, but a DEVICE, and it must survive.
+        json!({"id": 70, "type": "PipeWire:Interface:Node", "info": {"props": {
+            "object.serial": 700, "node.name": "bluez_output.AA_BB_CC.1",
+            "node.description": "WH-1000XM4", "media.class": "Audio/Sink",
+            "device.id": 42, "device.api": "bluez5", "api.bluez5.transport": "a2dp-sink"
+        }}}),
+        port(71, 70, "playback_FL", "in", "FL"),
+    ]);
+    let world = World::local(graph);
+    let snapshot = world.inspect();
+    let ids: Vec<&str> = snapshot["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|output| output["id"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        !ids.iter().any(|id| id.contains("fabric_6_deadbeef")),
+        "a pipe to another host is not an output here: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id.contains("bluez_output")),
+        "a Bluetooth headset is a local device and must survive the rule: {ids:?}"
+    );
+    // And the manifest is what a peer believes, so the pipe must be absent from that too —
+    // otherwise the circle is merely hidden from this host's own menu.
+    assert!(
+        !serde_json::to_string(&snapshot).unwrap().contains("deadbeef"),
+        "the pipe must not reach a peer by any path"
+    );
+}

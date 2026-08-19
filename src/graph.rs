@@ -86,6 +86,11 @@ struct Node {
     media_role: String,
     carrier: Option<String>,
     profile: Option<String>,
+    /// PipeWire's own marker for "this node's audio leaves the machine over a network".
+    network: bool,
+    /// Whether real hardware backs this node. A sound card, a USB headset and a Bluetooth headset
+    /// all have one; a tunnel does not.
+    device_backed: bool,
     volume: f64,
     muted: bool,
 }
@@ -292,6 +297,11 @@ impl Graph {
                                 }
                             },
                             media_role: text(props, "media.role"),
+                            network: props
+                                .get("node.network")
+                                .map(|value| value.as_bool() == Some(true) || value == "true")
+                                .unwrap_or(false),
+                            device_backed: props.get("device.id").is_some(),
                             carrier: props
                                 .get("alsa.nixaudio.device")
                                 .and_then(Value::as_str)
@@ -355,6 +365,23 @@ impl Graph {
         for node in nodes
             .values()
             .filter(|node| matches!(node.media_class.as_str(), "Audio/Sink" | "Audio/Source"))
+            // A NODE THAT IS ITSELF A NETWORK TRANSPORT IS NOT AN ENDPOINT ON THIS MACHINE.
+            //
+            // It is a pipe to somewhere else, and treating it as a local device makes nixaudio tell
+            // its peers something untrue: "this host has an output called X". A peer believes that,
+            // sends audio for X, our JackTrip delivers it, and the pipe forwards it straight back
+            // out. That is a circle, and it costs real bandwidth on the same wire the audio needs --
+            // 9.35 Mbit/s of it, measured, when the retired Pulse mesh was still loaded here.
+            //
+            // Excluding the node makes the circle unconstructible rather than merely absent: it can
+            // be neither advertised to a peer nor chosen locally, so no combination of routes can
+            // build one.
+            //
+            // `device.id` is the guard. Anything backed by real hardware is a device, whatever else
+            // it is flagged: a sound card, a USB headset, a BLUETOOTH headset. Bluetooth is a local
+            // device reached over a radio, not a network transport, and PipeWire does not mark it
+            // as one -- but the guard means it survives here even if some future version did.
+            .filter(|node| !node.network || node.device_backed)
         {
             let (mut id, device, label) = endpoint_identity(node);
             if endpoint_nodes.contains_key(&id) {
