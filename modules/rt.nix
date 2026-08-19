@@ -1,31 +1,37 @@
 # nixaudio.rt — the scheduling privileges PipeWire's realtime module needs.
 #
-# WHAT IS ACTUALLY BROKEN, AND WHAT IS NOT
+# TWO DIFFERENT FAULTS WEAR THE SAME LOG LINE
 #
-# It is easy to read `mod.rt: could not set nice-level to -11: Permission denied` in the PipeWire log
-# and conclude realtime scheduling is broken. On the machine that produced this module it was not:
+# `mod.rt: could not set nice-level to -11: Permission denied` in the PipeWire log can mean either
+# of two things, and they are not equally serious. Check which before believing anything else:
 #
-#   data-loop.0    SCHED_RR   priority 20
-#   fabric-loop.0  SCHED_RR   priority 20
+#   ps -Lo comm,cls,rtprio -C pipewire
+#   ps -Lo comm,cls,rtprio -C jacktrip
 #
-# The audio threads had genuine realtime scheduling. `@audio - rtprio 99` was present and the user
-# was in the group. What was missing was RLIMIT_NICE, which governs only the negative *nice* value
-# PipeWire additionally tries to set on its MAIN thread — a nicety, not the realtime path.
+# On a host that already has `@audio - rtprio 99` and a user in the group, the data loops come back
+# `FF` — genuine realtime — and the only thing missing is RLIMIT_NICE, which governs the negative
+# *nice* value PipeWire additionally asks for on its MAIN thread. A nicety, not the realtime path.
 #
-# So this module fixes a real gap without pretending it was the important one. The distinction
-# matters because "audio crackles" and "the main thread runs at nice 0" are different problems, and
-# conflating them sends the next person down the wrong path.
+# On a host with no limits at all they come back `TS`, and so does every audio thread in the
+# process tree. That is the serious one, and it is silent: JackTrip prints "Failed to set the
+# scheduler policy and priority" once at startup and then runs anyway, badly. Measured on one such
+# host against an otherwise identical one that had the grant: ~90x the xruns on the same hardware,
+# same kernel, same binary, same quantum.
+#
+# So the fix is the same either way and the diagnosis is not. "Audio crackles" and "the main thread
+# runs at nice 0" are different problems, and conflating them sends the next person down the wrong
+# path — which is exactly what an earlier version of this comment did, by reporting one host's
+# healthy `SCHED_RR 20` as though it were what every host looks like.
 #
 # ── WHY THE GROUP IS A NAME AND NEVER A NUMBER ──────────────────────────────────────────────────
 #
-# `nixiam.posix` is this fleet's single POSIX uid/gid registry: device groups are declared once and
-# converge across every machine (`audio` is 403 here, alongside video 401, render 402, input 404).
-# A limits.d line keyed on a NAME resolves through that registry. A module that invented its own gid
-# would be declaring a second, competing number for one kernel namespace — exactly what the registry
-# exists to prevent, and a failure that only shows up on the machine where the numbers disagree.
+# A limits line keyed on a group NAME resolves through whatever uid/gid registry the deployment
+# keeps, so the number can converge across machines however that deployment arranges it. A module
+# that invented its own gid would be declaring a second, competing number for one kernel namespace,
+# and the failure only shows up on the machine where the two disagree.
 #
-# So this module names the group and never numbers it. Where nixiam is composed, an assertion checks
-# the group is actually declared there rather than assuming it exists.
+# So this module names the group and never numbers it. Where a registry is composed, an assertion
+# checks the group is actually declared there rather than assuming it exists.
 { lib, config, ... }:
 let
   cfg = config.nixaudio.rt;
@@ -56,9 +62,10 @@ in
       description = ''
         POSIX group granted the scheduling limits below, by NAME.
 
-        Never a gid: `nixiam.posix` owns the fleet's uid/gid registry and converges device groups
-        across machines. Declaring a number here would create a second, competing claim on one
-        kernel namespace, and the disagreement would only surface on whichever machine lost.
+        Never a gid. Wherever a deployment keeps its uid/gid registry, that is what converges the
+        number across machines; declaring one here would create a second, competing claim on a
+        single kernel namespace, and the disagreement would surface only on whichever machine lost.
+        `nixiam.posix` is read when it happens to be composed, and assumed absent otherwise.
       '';
     };
 
@@ -71,7 +78,8 @@ in
 
         95 rather than 99 leaves headroom above the audio stack for anything that genuinely must
         preempt it (watchdogs, the kernel's own threads), which is the usual pro-audio guidance.
-        PipeWire asks for far less than either — its data loops run at 20.
+        PipeWire asks for far less than either: its data loops typically run in the twenties to the
+        high eighties depending on how the distribution configures them.
       '';
     };
 
@@ -126,9 +134,10 @@ in
           nixaudio.rt.group is "${cfg.group}", but nixiam is composed on this host and does not
           declare that group in nixiam.posix.deviceGroups or nixiam.posix.groups.
 
-          nixiam owns the fleet's uid/gid registry. Add the group there so its gid converges across
-          machines, rather than letting each host's distro pick a number — an NFS export shared
-          between two hosts that disagree grants access by NUMBER, not by name.
+          Add the group to that registry so its gid converges across machines, rather than letting
+          each host's distribution pick a number independently. Anything that grants access by
+          NUMBER rather than by name — a shared network filesystem, most obviously — breaks on the
+          machine where the two disagree, and nowhere else.
         '';
       }
     ];
