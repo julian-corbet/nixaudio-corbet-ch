@@ -278,7 +278,21 @@ fn arguments(plan: &SessionPlan, transport: &ResolvedTransport) -> Vec<String> {
         "--bufstrategy".into(),
         "3".into(),
         "--udprt".into(),
-        "--timeout".into(),
+        // NO `--timeout`. It makes JackTrip exit after ten seconds without a packet, and every
+        // ordinary interruption is longer than that: a Wi-Fi roam, a NAT rebind, a lift, a laptop
+        // carried between rooms. Killing the session then is the wrong answer to a gap that would
+        // have healed by itself, and it is a restart where the session could have survived.
+        //
+        // It was kept for one reason, and that reason has since expired. A pinned route used to
+        // notice its destination was gone only when the JackTrip node's ports left the graph, and
+        // the ports only left when the process exited -- so the fallback depended on this flag.
+        // `Graph::is_usable` now requires the PEER to be answering as well, so absence is observed
+        // on the control plane, in about six seconds, without killing anything.
+        //
+        // What is genuinely lost is recovery of a session whose media died while its control plane
+        // stayed up AND its address did not change -- rare, since an address change already
+        // respawns through `WorkerSpec`. That case wants a media-liveness signal, not a ten-second
+        // hair trigger on every peer in the circle.
     ]);
     args
 }
@@ -685,10 +699,11 @@ mod tests {
         // path allows rather than a constant chosen for some other path.
         assert!(args.windows(2).any(|v| v == ["--queue", "auto"]));
 
-        // `--timeout` is load-bearing and must not be tidied away. It is what makes a JackTrip that
-        // has stopped receiving exit, which is what removes its ports from the local graph, which
-        // is one of the two things that lets a pinned route notice its destination is gone.
-        assert!(args.iter().any(|v| v == "--timeout"));
+        // `--timeout` must NOT be passed. Ten seconds without a packet is not evidence that a
+        // session is dead -- it is a roam, a rebind, a lift -- and exiting turns a gap that would
+        // have healed into a restart. Absence is now observed on the control plane instead, so
+        // nothing depends on the media process dying to notice it.
+        assert!(!args.iter().any(|v| v == "--timeout"));
 
         // `--zerounderrun` cannot do anything here: upstream forces the zero-underrun mode for any
         // non-negative buffer strategy before it ever reads the flag, and we always send 3.
