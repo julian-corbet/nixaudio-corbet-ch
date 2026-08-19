@@ -5,9 +5,11 @@
 # `timeout --kill-after=1s 6s pw-dump`, and timeout execs through PATH, so putting this
 # directory first is enough to intercept it.
 #
-# With --monitor: nixaudiod reads this stream only to learn that *something* changed
-# (bin/nixaudiod.rs treats any bytes at all as one refresh event). Following an events file
-# means a test injects a graph change by appending a line to it -- no polling, no sleeps.
+# With --monitor: following an events file means a test injects a graph change by appending a
+# line to it -- no polling, no sleeps. The daemon no longer treats any bytes at all as an event
+# (that made it feed its own loop off the Client objects its own `pw-dump` runs create), but a
+# line that is not pw-dump's `[...]` array framing is still taken at face value as "something
+# changed", which is exactly what an appended line here is.
 set -eu
 
 # A staged failure of the graph read itself. The daemon cannot see a PipeWire that has gone away
@@ -22,7 +24,12 @@ if [ "${1:-}" = "--monitor" ]; then
     # gets one event as soon as it subscribes. Reproducing that matters: without it the daemon
     # would sit on its startup snapshot until something else moved, and every test would have to
     # nudge it by hand for a reason that has nothing to do with what it was testing.
+    # The newline is load-bearing. Real pw-dump terminates every batch it prints, and the harness
+    # writes this file COMPACT and unterminated -- so without it the dump and the first appended
+    # event arrive as one unparseable line, and the daemon reads a change notification glued to
+    # the end of a JSON array.
     cat "$NIXAUDIO_FAKE_GRAPH"
+    echo
     exec tail -n 0 -f "$NIXAUDIO_FAKE_EVENTS"
 fi
 

@@ -45,6 +45,7 @@ pub struct World {
     bus_address: String,
     daemon: Option<Child>,
     graph_path: PathBuf,
+    stderr_path: PathBuf,
     events_path: PathBuf,
     log_path: PathBuf,
     config_path: PathBuf,
@@ -124,6 +125,7 @@ impl World {
         let fixtures = fixtures_directory();
 
         let graph_path = root.join("graph.json");
+        let stderr_path = root.join("daemon.stderr");
         let events_path = root.join("events");
         let log_path = root.join("calls.log");
         let config_path = root.join("config.json");
@@ -153,6 +155,7 @@ impl World {
             bus_address,
             daemon: None,
             graph_path,
+            stderr_path,
             events_path,
             log_path,
             config_path,
@@ -168,9 +171,17 @@ impl World {
     fn start_daemon(&mut self, offline: bool) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_nixaudiod"));
         self.apply_environment(&mut command, offline);
+        // Appended to a file rather than piped. A pipe nobody drains is a promise this harness
+        // cannot keep: every panic here offers the daemon's stderr, and a restart-based test
+        // needs the output from BEFORE the restart to still be there afterwards.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.stderr_path)
+            .expect("daemon stderr log");
         let child = command
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(log))
             .spawn()
             .expect("start nixaudiod");
         self.daemon = Some(child);
@@ -212,7 +223,28 @@ impl World {
         }
     }
 
-    /// Replace the graph the fake `pw-dump` reports, then wake the daemon.
+    /// Print raw text into the monitor stream, exactly as `pw-dump --monitor` prints a batch.
+    ///
+    /// `notify` sends a bare nudge, which the daemon takes at face value. This one lets a test
+    /// hand it a REAL batch and find out whether it decides to care.
+    pub fn inject(&self, batch: &str) {
+        use std::io::Write;
+        let mut events = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.events_path)
+            .unwrap();
+        writeln!(events, "{batch}").unwrap();
+    }
+
+    /// Poison the graph read WITHOUT nudging the daemon.
+    ///
+    /// The poison is invisible until something makes it run `pw-dump` again, which turns "did
+    /// this event wake the daemon?" into a question a test can actually ask: `health` going red
+    /// is proof it looked, and staying green is proof it did not.
+    pub fn break_graph_source_quietly(&self) {
+        std::fs::write(self.graph_path.with_extension("json.broken"), b"").unwrap();
+    }
+
     /// Make the graph read fail, as a PipeWire that has stopped answering.
     pub fn break_graph_source(&self) {
         std::fs::write(self.graph_path.with_extension("json.broken"), b"").unwrap();
@@ -372,8 +404,8 @@ impl World {
         );
     }
 
-    fn daemon_stderr(&self) -> String {
-        "(streamed to the test harness)".to_owned()
+    pub fn daemon_stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 
     fn await_bus_name(&self) {

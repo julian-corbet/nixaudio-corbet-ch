@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use nixaudio::{
     config::Config,
     fabric,
@@ -7,12 +7,13 @@ use nixaudio::{
     API_VERSION, BUS_NAME, INTERFACE, OBJECT_PATH,
 };
 use std::{
+    collections::HashSet,
     path::PathBuf,
     process::Stdio,
     sync::{Arc, RwLock},
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, BufReader},
     sync::mpsc,
     time::{sleep, Duration},
 };
@@ -195,6 +196,25 @@ impl AudioService {
     async fn changed(emitter: &SignalEmitter<'_>, revision: u64) -> zbus::Result<()>;
 }
 
+/// The PipeWire object types the snapshot is actually built from.
+///
+/// This filter is the point of `watch_pipewire`, not a tuning of it. `pw-dump --monitor` reports
+/// EVERY object on the server, and the loudest by far is `Client` -- one per connection, including
+/// the short-lived one that every `pw-dump` invocation makes just by running. Since `refresh`
+/// runs `pw-dump`, an unfiltered stream made this daemon feed its own event loop: refresh spawns
+/// pw-dump, pw-dump connects as a Client, that Client's arrival and departure come straight back
+/// here as events, and the loop settles at whatever the debounce allows and stays there forever.
+///
+/// Measured on corbet-archlxc before this filter: 7.37 revisions per second, sustained, on a graph
+/// whose snapshot was byte-identical across seconds -- 5% of a core and a `pw-dump` process every
+/// 136 ms to publish nothing.
+const RELEVANT_TYPES: [&str; 4] = [
+    "PipeWire:Interface:Node",
+    "PipeWire:Interface:Port",
+    "PipeWire:Interface:Link",
+    "PipeWire:Interface:Device",
+];
+
 async fn watch_pipewire(events: mpsc::Sender<()>) {
     loop {
         let child = tokio::process::Command::new("pw-dump")
@@ -204,14 +224,48 @@ async fn watch_pipewire(events: mpsc::Sender<()>) {
             .spawn();
         match child {
             Ok(mut child) => {
-                let mut stdout = child.stdout.take().unwrap();
-                let mut buffer = [0_u8; 8192];
-                loop {
-                    match stdout.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            let _ = events.try_send(());
+                let stdout = child.stdout.take().unwrap();
+                let mut lines = BufReader::new(stdout).lines();
+                // Ids last announced as one of RELEVANT_TYPES. A removal arrives as
+                // `{"id": N, "info": null}` with no type field at all, so type alone cannot judge
+                // it -- losing a sound card would read exactly like losing a Client. Tracking the
+                // ids is also what makes PipeWire's id REUSE safe: a freed id is handed straight
+                // back out, and every announcement rewrites that id's entry before any later
+                // removal can consult it.
+                let mut relevant: HashSet<u64> = HashSet::new();
+                // `pw-dump --monitor` frames each batch as a pretty-printed JSON array, its
+                // brackets alone on column zero.
+                let mut batch = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    batch.push_str(&line);
+                    batch.push('\n');
+                    // Not pw-dump's array framing at all, so we cannot classify it. Assume it
+                    // matters and say so at once, rather than accumulating toward a terminator
+                    // that is never coming. A bare change notification takes this path.
+                    if !batch.starts_with('[') {
+                        let _ = events.try_send(());
+                        batch.clear();
+                        continue;
+                    }
+                    // A batch ends on the array's closing bracket, which is the last thing on its
+                    // line whether the dump is pretty-printed over many lines or compact on one.
+                    // An INNER array can end a line too, so completeness is settled by the parse
+                    // and not by the bracket -- an unparseable prefix simply means "not yet".
+                    if line.trim_end().ends_with(']') {
+                        if let Ok(objects) = serde_json::from_str::<Vec<serde_json::Value>>(&batch)
+                        {
+                            if touches_the_graph(objects, &mut relevant) {
+                                let _ = events.try_send(());
+                            }
+                            batch.clear();
+                            continue;
                         }
+                    }
+                    // Unparseable AND unbounded. Assume it mattered and start clean, because the
+                    // alternative is a buffer that grows until the daemon dies.
+                    if batch.len() > MAX_BATCH {
+                        let _ = events.try_send(());
+                        batch.clear();
                     }
                 }
                 let _ = child.kill().await;
@@ -222,13 +276,54 @@ async fn watch_pipewire(events: mpsc::Sender<()>) {
     }
 }
 
-fn refresh(controller: &Controller, published: &Arc<RwLock<fabric::Manifest>>) -> Result<u64> {
+/// The largest batch we will hold before giving up on parsing it and refreshing anyway.
+const MAX_BATCH: usize = 16 * 1024 * 1024;
+
+/// Whether one monitor batch touched anything a snapshot is made of.
+fn touches_the_graph(objects: Vec<serde_json::Value>, relevant: &mut HashSet<u64>) -> bool {
+    let mut fire = false;
+    for object in objects {
+        let Some(id) = object.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        match object.get("type").and_then(serde_json::Value::as_str) {
+            Some(kind) => {
+                if RELEVANT_TYPES.contains(&kind) {
+                    relevant.insert(id);
+                    fire = true;
+                } else {
+                    relevant.remove(&id);
+                }
+            }
+            None => {
+                if relevant.remove(&id) {
+                    fire = true;
+                }
+            }
+        }
+    }
+    fire
+}
+
+/// Reconcile the world, and report a new revision ONLY if the world actually moved.
+///
+/// `Ok(None)` means the pass was real work that changed nothing, which is the common case: this
+/// runs on every PipeWire event and on a two-second fabric tick, and an idle host produces a
+/// byte-identical snapshot every time. Bumping the counter regardless made `changed` a heartbeat
+/// rather than news, and every client that trusted it re-fetched a snapshot it already had.
+fn refresh(
+    controller: &Controller,
+    published: &Arc<RwLock<fabric::Manifest>>,
+) -> Result<Option<u64>> {
     let mut runtime = controller.inner.write().unwrap();
     if let Ok(config) = Config::load() {
         runtime.config = config;
     }
-    let next = runtime.revision + 1;
-    let graph = Graph::inspect(&runtime.config, &runtime.state, &runtime.fabric, next)?;
+    // Inspected at the CURRENT revision deliberately: `Graph::inspect` bakes the number it is
+    // handed into the snapshot it returns, so inspecting at `current + 1` would make every
+    // snapshot differ from its predecessor in precisely the field the comparison must see past.
+    let current = runtime.revision;
+    let graph = Graph::inspect(&runtime.config, &runtime.state, &runtime.fabric, current)?;
     if let Err(error) = graph.reconcile_transport() {
         eprintln!("nixaudiod: reconcile JackTrip links: {error}");
     }
@@ -262,11 +357,19 @@ fn refresh(controller: &Controller, published: &Arc<RwLock<fabric::Manifest>>) -
         }
     }
     *published.write().unwrap() = graph.local_manifest();
+    // A good read retires the warning; the snapshot is current again. Recovering counts as a
+    // change in its own right even when the graph is identical -- `health` goes from error back
+    // to ok, and that is exactly the transition a client is waiting to be told about.
+    let recovered = runtime.stale.take().is_some();
+    let moved = recovered || graph.snapshot != runtime.graph.snapshot;
     runtime.graph = graph;
+    if !moved {
+        return Ok(None);
+    }
+    let next = current + 1;
+    runtime.graph.snapshot.revision = next;
     runtime.revision = next;
-    // A good read retires the warning; the snapshot is current again.
-    runtime.stale = None;
-    Ok(next)
+    Ok(Some(next))
 }
 
 #[tokio::main]
@@ -366,10 +469,13 @@ async fn main() -> Result<()> {
         let worker = controller.clone();
         let worker_manifest = published.clone();
         match tokio::task::spawn_blocking(move || refresh(&worker, &worker_manifest)).await {
-            Ok(Ok(revision)) => {
+            Ok(Ok(Some(revision))) => {
                 let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
                 AudioService::changed(&emitter, revision).await?;
             }
+            // The pass ran and nothing moved. Waking every client to hand back a snapshot they
+            // already hold is the cost this branch exists in order not to pay.
+            Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 eprintln!("nixaudiod: graph refresh: {error}");
                 controller.inner.write().unwrap().stale = Some(error.to_string());

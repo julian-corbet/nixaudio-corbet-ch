@@ -9,6 +9,7 @@
 mod support;
 
 use serde_json::json;
+use std::time::Duration;
 use support::{link, manifest, port, sink, stream, FakePeer, World};
 
 /// One sink and one application, which is the smallest world that is still recognisably the
@@ -662,4 +663,108 @@ fn a_network_pipe_is_usable_here_but_never_advertised_to_a_peer() {
         advertised.iter().any(|id| id.contains("bluez_output")),
         "and it must still be told about the Bluetooth headset: {advertised:?}"
     );
+}
+
+
+/// PipeWire stores a level CUBED, and in a per-channel array. `wpctl set-volume` cubes its
+/// argument on the way in, so anything that reads the level back without taking the cube root is
+/// not reading what it wrote.
+///
+/// This is a regression test with a date on it: every one of the eleven endpoints on
+/// corbet-archlxc reported 1.0 while `wpctl` and the mixer both showed 0.40, because the read
+/// preferred `Props.volume` -- a separate master knob that sits at unity on every node here -- to
+/// the `channelVolumes` array that actually carries the level. The tray had been confidently
+/// displaying 100% for a device at 40%.
+#[test]
+fn a_level_is_reported_the_way_the_mixer_shows_it() {
+    let mut quiet_sink = sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo");
+    quiet_sink["info"]["params"] = json!({
+        "Props": [{ "volume": 1.0, "channelVolumes": [0.064, 0.064], "mute": false }]
+    });
+    let world = World::local(json!([
+        quiet_sink,
+        port(11, 10, "playback_FL", "in", "FL"),
+        port(12, 10, "playback_FR", "in", "FR"),
+    ]));
+
+    let snapshot = world.until("the sink to be read", |s| {
+        s["outputs"].as_array().is_some_and(|o| !o.is_empty())
+    });
+    let level = snapshot["outputs"][0]["volume"].as_f64().expect("a level");
+    assert!(
+        (level - 0.4).abs() < 0.001,
+        "0.064 on the wire is 0.40 on the mixer, not {level}"
+    );
+}
+
+/// A pass that finds nothing new must not announce one.
+///
+/// `changed` is meant to be news. Bumping the revision on every pass made it a heartbeat instead,
+/// and every client that trusted it re-fetched a snapshot it already held.
+#[test]
+fn an_event_that_changes_nothing_does_not_advance_the_revision() {
+    let world = World::local(one_sink_and_firefox("A useful tab"));
+    world.until("the graph to be read", |s| {
+        s["outputs"].as_array().is_some_and(|o| !o.is_empty())
+    });
+
+    let before = world.inspect()["revision"].as_u64().expect("a revision");
+    for _ in 0..5 {
+        world.notify();
+    }
+    std::thread::sleep(Duration::from_millis(750));
+    let after = world.inspect()["revision"].as_u64().expect("a revision");
+
+    assert_eq!(
+        before, after,
+        "five events over an unchanged graph are still no news"
+    );
+}
+
+/// The daemon must not wake on its own reflection.
+///
+/// Every `pw-dump` it runs connects to PipeWire as a Client, and `pw-dump --monitor` duly reports
+/// that Client arriving and leaving. Treating those as graph changes closed a loop through the
+/// daemon itself: measured on corbet-archlxc at 7.37 refreshes per second, sustained, on a graph
+/// whose snapshot was byte-identical throughout -- 5% of a core to publish nothing.
+///
+/// Proven in both directions on purpose. Without the second half this would still pass on a
+/// daemon that had merely stopped reading its monitor at all.
+#[test]
+fn a_client_appearing_is_not_a_graph_change_but_a_node_is() {
+    let world = World::local(one_sink_and_firefox("A useful tab"));
+
+    // Wait for a refresh to COMPLETE, not merely for the daemon to look healthy: the startup
+    // snapshot is already healthy, so anything less races the very first monitor event and
+    // poisons the graph inside its debounce window.
+    world.stage(json!([
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+        port(12, 10, "playback_FR", "in", "FR"),
+        sink(30, 300, "alsa_output.usb-shure", "shure", "analog-stereo"),
+        port(31, 30, "playback_FL", "in", "FL"),
+        port(32, 30, "playback_FR", "in", "FR"),
+    ]));
+    world.until("the second sink to arrive", |s| {
+        s["outputs"].as_array().is_some_and(|o| o.len() == 2)
+    });
+
+    // Poison the read without saying so. From here, `health` going red means it looked.
+    world.break_graph_source_quietly();
+
+    world.inject(r#"[{"id": 86, "type": "PipeWire:Interface:Client", "info": {"props": {}}}]"#);
+    world.inject(r#"[{"id": 86, "info": null}]"#);
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        world.inspect()["health"]["status"],
+        "ok",
+        "a Client arriving and leaving is the daemon's own reflection, not a graph change\nstderr:\n{}",
+        world.daemon_stderr()
+    );
+
+    // A Node is a different matter -- and proves the poison was live the whole time.
+    world.inject(r#"[{"id": 10, "type": "PipeWire:Interface:Node", "info": {"props": {}}}]"#);
+    world.until("the poisoned read to be noticed", |s| {
+        s["health"]["status"] == "error"
+    });
 }

@@ -12,7 +12,7 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Snapshot {
     pub api_version: u32,
     pub revision: u64,
@@ -27,13 +27,13 @@ pub struct Snapshot {
     pub default_input: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Health {
     pub status: String,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Endpoint {
     pub id: String,
     pub device: String,
@@ -66,7 +66,7 @@ pub struct Endpoint {
     pub pipewire_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Stream {
     pub id: String,
     pub intent_key: String,
@@ -79,14 +79,14 @@ pub struct Stream {
     pub pipewire_id: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Peer {
     pub name: String,
     pub address: String,
     pub available: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DeclaredDevice {
     pub id: String,
     pub label: String,
@@ -168,17 +168,23 @@ fn volume_and_mute(info: &Value) -> (f64, bool) {
         .and_then(|v| v.get("Props"))
         .and_then(Value::as_array)
         .and_then(|v| v.first());
+    // PipeWire stores the level CUBED and PER CHANNEL, and `set_volume` below writes it through
+    // `wpctl set-volume`, which cubes its argument. So the cube root of the first channel is the
+    // only read that is the exact inverse of our own write.
+    //
+    // `Props.volume` is a SEPARATE master knob and sits at 1.0 on every node here, so reading it
+    // first reported 100% for every endpoint on this host while `wpctl` and the mixer both showed
+    // 40%. It stays as the fallback for a node that publishes no per-channel array, never as a
+    // multiplier: multiplying breaks the round trip the moment the master is not unity, and the
+    // slider then fights its own readback.
     let volume = props
-        .and_then(|v| v.get("volume"))
+        .and_then(|v| v.get("channelVolumes"))
+        .and_then(Value::as_array)
+        .and_then(|v| v.first())
         .and_then(Value::as_f64)
-        .or_else(|| {
-            props
-                .and_then(|v| v.get("channelVolumes"))
-                .and_then(Value::as_array)
-                .and_then(|v| v.first())
-                .and_then(Value::as_f64)
-        })
-        .unwrap_or(1.0);
+        .or_else(|| props.and_then(|v| v.get("volume")).and_then(Value::as_f64))
+        .unwrap_or(1.0)
+        .cbrt();
     let muted = props
         .and_then(|v| v.get("mute"))
         .and_then(Value::as_bool)
