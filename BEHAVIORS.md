@@ -10,14 +10,18 @@ Several computers, one audio system. A stream playing on any of them can be sent
 headset or microphone attached to any other — quickly enough to feel local, over whatever networks
 those machines happen to be on, with no server in the middle.
 
-This is **remote sound**: you are at one machine and the sound belongs on another. It is not a music
-collaboration tool, and musicians are not the audience it is designed around.
+What people do with that is theirs: play music together, record an interview across two rooms, put a
+laptop's sound on the good speakers, something nobody here has thought of yet. **nixaudio's role is
+to transport it.** There is no target user and no primary use case, and no use case may be designed
+against.
 
 ## Fixed goals
 
 | Goal | What it means |
 |---|---|
 | **It just works, reliably** | Reliability is the entire promise. Peers come and go — people close laptops, change networks, lose coverage, travel — and none of that is an error condition or something a user should have to attend to. Sessions re-form by themselves: no restart, no reconnect button, no diagnosis. Intermittency costs audio *quality*; it never costs the session. |
+| **Use-case agnostic** | nixaudio moves audio between machines and takes no position on why. Music played together, an interview recorded across two rooms, a laptop's sound on the good speakers — the same job every time. No use case is privileged in the design and none is designed out, and the ones that matter most are expected to be ones nobody here thought of. |
+| **Latency is never spent carelessly** | Somebody's use case always depends on it, so every avoidable millisecond is a defect: no buffer we do not need, no hop we can remove, no restart where the session could have survived. What a given path then delivers is the path's business — we do not promise a number, and we never add slack on the assumption that nobody will notice. |
 | **Peer to peer** | Media never passes through a server anyone else operates. A relay exists only for peers that cannot reach each other directly, and it forwards ciphertext it cannot read. |
 | **Joining is knowing the secret** | Any Internet-connected computer that knows the circle's secret can join it. No accounts, no directory service, no per-device approval step. |
 | **Encrypted between peers** | Every byte of media and control between two peers is authenticated and encrypted. The circle secret is what authenticates; it is not itself a media key. |
@@ -33,9 +37,6 @@ collaboration tool, and musicians are not the audience it is designed around.
 Each of these is a deliberate exclusion, not an omission awaiting a contributor.
 
 - **Video.** A separate product if it is ever built. Nothing here should be bent to accommodate it.
-- **Playing music together in time.** A different product with a different threshold — see *What no
-  software can do*. nixaudio moves sound between machines and makes no promise about ensemble
-  timing, so nothing may be designed around one.
 - **Grading the connection for the user.** No tiers, no modes, no quality badges. In a circle of a
   dozen machines some peers are always better connected than others; naming that tells the user
   nothing they can act on, because there is no other connection to switch to. Path quality belongs
@@ -103,14 +104,15 @@ dependency nor, where it can be avoided, even a route.
 
 A single mobile access leg costs 20–30 ms round trip before the audio has travelled anywhere, and
 its jitter is a property of the radio rather than of the route — it does not improve with a closer
-relay or a better path. Wi-Fi is close behind.
+relay or a better path. Wi-Fi is close behind. Playing in time together, for comparison, needs
+something under roughly 25 ms one-way on top of an endpoint floor near 8 ms.
 
-This is recorded because it is the reason for a non-goal, not because it is a promise being hedged.
-A laggy peer is a fact to be tolerated gracefully, not a bug to be fixed and not a state to be
-announced. Playing in time together needs latency below roughly 25 ms one-way against an endpoint
-floor near 8 ms, which is unreachable on any mobile connection and unreliable on most others; that
-is a different product. nixaudio is remote sound, and remote sound works fine at latencies where
-ensemble playing does not.
+This is recorded so that no promise gets designed around it in either direction. We do not tell a
+user that a path is good enough for what they are doing — only they can hear that. And we do not
+decide on their behalf that it is not: a connection that cannot carry an ensemble carries an
+interview perfectly well, and it is the same code either way. A laggy peer is a fact to be tolerated
+gracefully, not a bug to be fixed and not a state to be announced. What these numbers do oblige is
+the goal above — never spend latency we did not have to.
 
 ## Stated future, not a current goal
 
