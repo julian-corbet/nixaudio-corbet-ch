@@ -39,8 +39,15 @@ in
 
       port = lib.mkOption {
         type = lib.types.port;
-        default = 45900;
-        description = "TCP port for the nixaudio peer-control protocol.";
+        default = 26300;
+        description = ''
+          TCP port for the nixaudio peer-control protocol.
+
+          Deliberately below the kernel's default ephemeral floor of 32768. A port inside that range
+          is one the kernel may hand to any process that asks for "any port"; if it does so before
+          this daemon binds, the host silently drops out of its circle. The previous default, 45900,
+          sat inside it.
+        '';
       };
     };
 
@@ -66,7 +73,7 @@ in
 
           audioPort = lib.mkOption {
             type = lib.types.port;
-            example = 46001;
+            example = 26301;
             description = ''
               UDP port dedicated to this unordered peer pair. Both ends declare the same value.
               A host gives each peer a distinct port, allowing one independently supervised
@@ -186,6 +193,26 @@ in
       };
     };
   };
+
+  # A port at or above the ephemeral floor is one the kernel may already have handed to something
+  # else by the time we bind. JackTrip then exits, that pair carries no audio, and nothing in the
+  # audio graph explains it. A warning rather than an assertion: an operator may legitimately have
+  # narrowed the range, and /proc/sys/net/ipv4/ip_local_port_range is the only place that knows.
+  config.warnings =
+    let
+      ephemeralFloor = 32768;
+      offenders =
+        lib.optional (cfg.control.port >= ephemeralFloor)
+          "control.port ${toString cfg.control.port}"
+        ++ lib.mapAttrsToList (name: peer: "peers.${name}.audioPort ${toString peer.audioPort}")
+          (lib.filterAttrs (_: peer: peer.audioPort >= ephemeralFloor) cfg.peers);
+    in
+    lib.optionals cfg.enable (lib.optional (offenders != [ ]) ''
+      nixaudio.fabric: ${lib.concatStringsSep ", " offenders} at or above 32768, the usual
+      ephemeral-port floor. The kernel may hand such a port to any process asking for "any port"
+      before this host binds it; the bind then fails and that pair carries no audio. Choose ports
+      below the floor, or narrow net.ipv4.ip_local_port_range on every host in the circle.
+    '');
 
   config.assertions = lib.optionals cfg.enable [
     {

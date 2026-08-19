@@ -108,7 +108,7 @@ nixaudioctl mute stream:123 on
       control.listen = "192.168.1.10";
       peers.studio = {
         addresses = [ "192.168.1.20" ];
-        audioPort = 46001;
+        audioPort = 26301;
       };
     };
   };

@@ -39,7 +39,7 @@ let
       control.listen = "192.0.2.1";
       peers.beta = {
         addresses = [ "192.0.2.2" "beta.example.net" ];
-        audioPort = 46001;
+        audioPort = 26301;
       };
     };
   };
@@ -97,7 +97,7 @@ in
     && nixos.config.nixaudio.daemon.settings.control.listen == "192.0.2.1"
     && nixos.config.nixaudio.daemon.settings.peers.beta.addresses
     == [ "192.0.2.2" "beta.example.net" ]
-    && nixos.config.nixaudio.daemon.settings.peers.beta.audioPort == 46001
+    && nixos.config.nixaudio.daemon.settings.peers.beta.audioPort == 26301
     && nixos.config.nixaudio.daemon.settings.transport.command
     == [
       "${pkgs.pipewire.jack}/bin/pw-jack"
@@ -162,14 +162,14 @@ in
       (evalNixos [{
         nixaudio.fabric.peers.alpha = {
           addresses = [ "127.0.0.1" ];
-          audioPort = 46002;
+          audioPort = 26302;
         };
       }]) != [ ]
     && failed
       (evalNixos [{
         nixaudio.fabric.peers.gamma = {
           addresses = [ "192.0.2.3" ];
-          audioPort = 46001;
+          audioPort = 26301;
         };
       }]) != [ ]
   );
