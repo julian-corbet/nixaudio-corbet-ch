@@ -24,10 +24,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a test waits for the daemon to reach a state before calling it a failure. The refresh
-/// path debounces 120 ms and then re-reads the graph, so this is generous by two orders of
-/// magnitude on purpose: a flaky timeout is worse than a slow failure.
-const PATIENCE: Duration = Duration::from_secs(10);
+/// How long a test waits for the daemon to reach a state before calling it a failure.
+///
+/// The refresh path debounces 120 ms, which this used to be generous against by two orders of
+/// magnitude. It no longer is, and the reason matters: declaring a peer unreachable deliberately
+/// costs three consecutive failed probes on a two-second reconcile, so roughly six seconds pass
+/// before anything observable happens -- by design, so a Wi-Fi roam is not an outage. Ten seconds
+/// left an outage test finishing at 8.2 s, which is a flake waiting to happen. A flaky timeout is
+/// worse than a slow failure.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// How long any single `nixaudioctl` call may take before the harness gives up on it. Well under
 /// `PATIENCE`, so a stuck call surfaces as a failed call rather than as a stalled poll loop.
@@ -384,6 +389,7 @@ fn start_bus(root: &Path) -> (Child, String) {
 /// without a network, a second daemon, or a JackTrip.
 pub struct FakePeer {
     pub port: u16,
+    manifest: Value,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -391,11 +397,23 @@ impl FakePeer {
     pub fn serving(manifest: Value) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a fake peer");
         let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self::answer(listener, manifest.clone(), stop.clone());
+        Self {
+            port,
+            manifest,
+            stop,
+        }
+    }
+
+    fn answer(
+        listener: TcpListener,
+        manifest: Value,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         listener
             .set_nonblocking(true)
             .expect("poll rather than block forever on accept");
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
             const GREETING: usize = "NXAUDIO/1 MANIFEST\n".len();
@@ -417,13 +435,47 @@ impl FakePeer {
                     Err(_) => break,
                 }
             }
+            drop(listener);
         });
-        Self { port, stop }
     }
 
-    /// Stop answering, as a peer whose control endpoint has gone away.
+    /// Stop answering, as a peer whose control endpoint has gone away. Returns once the port is
+    /// actually refusing connections, so a test cannot race the outage it just caused.
     pub fn silence(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let address = format!("127.0.0.1:{}", self.port).parse().unwrap();
+        for _ in 0..400 {
+            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+                return;
+            }
+            sleep(Duration::from_millis(10));
+        }
+        panic!("fake peer on {} never stopped answering", self.port);
+    }
+
+    /// Answer again on the SAME port, as the same member coming back. Identity is the port here,
+    /// exactly as it is an address in the real thing: nothing about the peer changed while it was
+    /// away, which is the whole point of the behaviour being tested.
+    pub fn come_back(&self) {
+        self.stop
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Retry rather than expect. The port was ephemeral, so while this peer was away the kernel
+        // was free to hand it to any other test binding :0 -- and the suite runs them in parallel,
+        // which turned a real race into an intermittent panic that looked like a product failure.
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match TcpListener::bind(("127.0.0.1", self.port)) {
+                Ok(listener) => {
+                    Self::answer(listener, self.manifest.clone(), self.stop.clone());
+                    return;
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("fake peer could not reclaim port {}: {error}", self.port),
+            }
+        }
     }
 }
 

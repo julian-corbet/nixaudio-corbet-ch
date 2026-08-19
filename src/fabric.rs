@@ -71,11 +71,35 @@ pub struct Snapshot {
     pub peers: BTreeMap<String, PeerSnapshot>,
 }
 
+/// Consecutive failed probes before a peer is called unreachable.
+///
+/// One `fetch()` already spends up to 1.8 s on a dead address (900 ms to connect plus 900 ms to
+/// read), so three passes is roughly six seconds of wall clock: long enough to ride out a Wi-Fi
+/// roam, a NAT rebind or a peer's own reconfiguration without telling anybody, short enough that a
+/// real outage is labelled before someone wonders. It is deliberately asymmetric -- going away is a
+/// claim that needs evidence, coming back is not, so ONE answer restores the peer immediately.
+const MISSES_BEFORE_UNREACHABLE: u32 = 3;
+
+/// Passes to skip after a worker fails to start, doubling to this ceiling.
+///
+/// A command that cannot execute fails identically every 2 s forever, which is how a broken
+/// `transport.command` once produced 86 000 journal lines a day on a live desktop. Backing off
+/// costs nothing a peer notices: it only delays retrying something that has never worked.
+const MAX_SPAWN_BACKOFF: u32 = 64;
+
 #[derive(Clone, Debug)]
 pub struct PeerSnapshot {
     pub address: String,
+    /// The last manifest this peer published, kept for as long as it stays configured -- including
+    /// while it is away. This is what lets an absent peer's endpoints keep their identities, so a
+    /// route pinned to one still names something real and can be reclaimed when it returns.
     pub manifest: Manifest,
     pub plan: SessionPlan,
+    /// Whether the CONTROL plane has answered recently. Not a claim that media flows: `graph.rs`
+    /// combines this with the media-plane facts it can see before publishing an endpoint as usable.
+    pub available: bool,
+    /// Consecutive failed probes. Absence is never inferred from one.
+    pub misses: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +117,16 @@ struct Worker {
 #[derive(Default)]
 pub struct Runtime {
     workers: BTreeMap<String, Worker>,
+    /// Carried across passes. A peer that fails a probe keeps its identity, its endpoints and
+    /// therefore any route pinned to it; only removal from configuration deletes one. Rebuilding
+    /// this from scratch every pass is what made a pinned target cease to exist the instant its
+    /// host blinked.
+    peers: BTreeMap<String, PeerSnapshot>,
+    /// Failed probes for peers that have never once answered, which have no `PeerSnapshot` to
+    /// count in. Exists so the first failure is reported and the next ten thousand are not.
+    unseen: BTreeMap<String, u32>,
+    /// Remaining passes to skip before retrying a worker that would not start.
+    spawn_backoff: BTreeMap<String, u32>,
 }
 
 fn safe(value: &str) -> String {
@@ -285,16 +319,18 @@ async fn fetch(peer: &PeerConfig) -> Result<(String, Manifest)> {
 
 impl Runtime {
     pub async fn reconcile(&mut self, config: &Config, local: &Manifest) -> Result<Snapshot> {
-        let mut snapshot = Snapshot::default();
         for (name, peer) in &config.peers {
             // A peer's own failure costs that peer and nothing else. Returning early here would
             // starve every peer sorted after it -- `peers` is a BTreeMap, so the same ones every
             // pass -- and skip the reaping below, leaking a worker for every peer ever removed.
-            match self.reconcile_peer(config, local, name, peer).await {
-                Ok(entry) => {
-                    snapshot.peers.insert(name.clone(), entry);
-                }
-                Err(error) => eprintln!("nixaudiod: peer {name}: {error:#}"),
+            self.observe(name, probe(config, local, name, peer).await);
+
+            // Supervision runs on EVERY pass, whether or not the peer answered. A JackTrip that
+            // exited on its own -- which is exactly what happens when media stops, ten seconds
+            // later, by its own --timeout -- has to be reaped, and the old code returned at the
+            // failed fetch before it could be, so that child sat in the table forever.
+            if let Err(error) = self.supervise(config, name).await {
+                eprintln!("nixaudiod: peer {name}: {error:#}");
             }
         }
 
@@ -313,46 +349,154 @@ impl Runtime {
                 let _ = worker.child.wait().await;
             }
         }
-        Ok(snapshot)
-    }
+        self.peers.retain(|name, _| config.peers.contains_key(name));
+        self.unseen.retain(|name, _| config.peers.contains_key(name));
+        self.spawn_backoff
+            .retain(|name, _| config.peers.contains_key(name));
 
-    async fn reconcile_peer(
-        &mut self,
-        config: &Config,
-        local: &Manifest,
-        name: &str,
-        peer: &PeerConfig,
-    ) -> Result<PeerSnapshot> {
-        let (address, remote) = fetch(peer).await?;
-        let plan = plan(
-            &config.node,
-            name,
-            &address,
-            peer.audio_port,
-            local,
-            &remote,
-        )?;
-        let spec = worker_spec(&plan, &config.transport.command, &config.transport_for(name));
-
-        let restart = match self.workers.get_mut(name) {
-            Some(worker) if worker.spec == spec => worker.child.try_wait()?.is_some(),
-            Some(worker) => {
-                let _ = worker.child.kill().await;
-                let _ = worker.child.wait().await;
-                true
-            }
-            None => true,
-        };
-        if restart {
-            let child = spawn_worker(&spec)?;
-            self.workers.insert(name.to_owned(), Worker { spec, child });
-        }
-        Ok(PeerSnapshot {
-            address,
-            manifest: remote,
-            plan,
+        Ok(Snapshot {
+            peers: self.peers.clone(),
         })
     }
+
+    /// Fold one probe outcome into this peer's record. Logs only TRANSITIONS: an outage that lasts
+    /// an hour is two lines, not eighteen hundred.
+    fn observe(&mut self, name: &str, probe: Result<(String, Manifest, SessionPlan)>) {
+        match probe {
+            Ok((address, manifest, plan)) => {
+                self.unseen.remove(name);
+                match self.peers.get_mut(name) {
+                    Some(record) => {
+                        if !record.available {
+                            eprintln!("nixaudiod: peer {name}: answering again at {address}");
+                        }
+                        record.address = address;
+                        record.manifest = manifest;
+                        record.plan = plan;
+                        record.available = true;
+                        record.misses = 0;
+                    }
+                    None => {
+                        self.peers.insert(
+                            name.to_owned(),
+                            PeerSnapshot {
+                                address,
+                                manifest,
+                                plan,
+                                available: true,
+                                misses: 0,
+                            },
+                        );
+                    }
+                }
+            }
+            Err(error) => match self.peers.get_mut(name) {
+                Some(record) => {
+                    record.misses = record.misses.saturating_add(1);
+                    if record.available && record.misses >= MISSES_BEFORE_UNREACHABLE {
+                        record.available = false;
+                        eprintln!(
+                            "nixaudiod: peer {name}: unreachable after {} probes: {error:#}",
+                            record.misses
+                        );
+                    }
+                }
+                // Never once answered, so there is nothing to keep and nothing to fall back from.
+                // Report the first failure and then stay quiet: a peer that is simply switched off
+                // is not news every two seconds.
+                None => {
+                    let misses = self.unseen.entry(name.to_owned()).or_default();
+                    *misses += 1;
+                    if *misses == 1 {
+                        eprintln!("nixaudiod: peer {name}: no answer yet: {error:#}");
+                    }
+                }
+            },
+        }
+    }
+
+    /// Bring this peer's JackTrip process into line with what we currently know.
+    async fn supervise(&mut self, config: &Config, name: &str) -> Result<()> {
+        // Reap first, unconditionally. `try_wait` is what turns an exited child into a freed slot;
+        // without it the `Child` is retained, so `kill_on_drop` never runs and the zombie stays.
+        if let Some(worker) = self.workers.get_mut(name) {
+            if worker.child.try_wait()?.is_some() {
+                if let Some(mut worker) = self.workers.remove(name) {
+                    let _ = worker.child.wait().await;
+                }
+            }
+        }
+
+        // Only a peer we currently believe in justifies a running session. While it is unreachable
+        // we hold what we know and start nothing: respawning from a cached plan would aim a media
+        // session at an address we have no present evidence for, and would do it every two seconds.
+        let Some(record) = self.peers.get(name).filter(|record| record.available) else {
+            return Ok(());
+        };
+        let spec = worker_spec(
+            &record.plan,
+            &config.transport.command,
+            &config.transport_for(name),
+        );
+
+        match self.workers.get(name) {
+            // Already running exactly this. Nothing to do -- and in particular no restart, which
+            // would be an audible gap bought for nothing.
+            Some(worker) if worker.spec == spec => return Ok(()),
+            Some(_) => {
+                if let Some(mut worker) = self.workers.remove(name) {
+                    let _ = worker.child.kill().await;
+                    let _ = worker.child.wait().await;
+                }
+            }
+            None => {}
+        }
+
+        if let Some(remaining) = self.spawn_backoff.get_mut(name) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(());
+            }
+        }
+        match spawn_worker(&spec) {
+            Ok(child) => {
+                self.spawn_backoff.remove(name);
+                self.workers.insert(name.to_owned(), Worker { spec, child });
+                Ok(())
+            }
+            Err(error) => {
+                let backoff = self.spawn_backoff.entry(name.to_owned()).or_insert(0);
+                let first = *backoff == 0;
+                *backoff = (*backoff * 2 + 1).min(MAX_SPAWN_BACKOFF);
+                if first {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Ask a peer what it has, and work out the session that follows. Pure: it neither starts nor stops
+/// anything, which is what lets the caller record the ANSWER even when the process work then fails.
+/// Conflating the two is how a peer that answered perfectly well lost every one of its endpoints
+/// because a local command was missing.
+async fn probe(
+    config: &Config,
+    local: &Manifest,
+    name: &str,
+    peer: &PeerConfig,
+) -> Result<(String, Manifest, SessionPlan)> {
+    let (address, remote) = fetch(peer).await?;
+    let session = plan(
+        &config.node,
+        name,
+        &address,
+        peer.audio_port,
+        local,
+        &remote,
+    )?;
+    Ok((address, remote, session))
 }
 
 async fn serve_connection(mut stream: TcpStream, manifest: Arc<RwLock<Manifest>>) -> Result<()> {

@@ -46,18 +46,31 @@ impl Controller {
             );
         }
         let mut runtime = self.inner.write().unwrap();
-        for target in &targets {
-            if !runtime.graph.has_endpoint(target) {
-                anyhow::bail!("unknown or unavailable output {target}");
-            }
+        // ADDRESSABLE, not available. Pinning a stream to a peer that is currently asleep has to be
+        // legal: intent is a durable statement about where sound belongs, and if it could only be
+        // expressed while the destination happened to be up, it could never survive an outage --
+        // which is the entire behaviour this exists to provide.
+        let unknown = {
+            let runtime = &*runtime;
+            targets
+                .iter()
+                .find(|target| !runtime.graph.is_addressable(&runtime.config, target))
+                .cloned()
+        };
+        if let Some(target) = unknown {
+            anyhow::bail!("unknown output {target}");
         }
-        runtime.graph.apply_route(stream, &targets)?;
         let intent = runtime.graph.stream_intent(stream)?.to_owned();
+        // Record the ask before honouring it. What the user wants is the fact worth keeping;
+        // whether it can be delivered this second is not, and writing the second one down is how a
+        // fallback quietly becomes the intent and the route never comes back.
         runtime
             .state
             .routes
-            .insert(intent, targets.into_iter().collect());
+            .insert(intent, targets.iter().cloned().collect());
         runtime.state.save(&runtime.state_path)?;
+        let effective = runtime.graph.resolve(&targets);
+        runtime.graph.apply_route(stream, &effective)?;
         let _ = self.refresh.try_send(());
         Ok(())
     }
@@ -204,23 +217,30 @@ fn refresh(controller: &Controller, published: &Arc<RwLock<fabric::Manifest>>) -
     if let Err(error) = graph.reconcile_defaults(&runtime.state) {
         eprintln!("nixaudiod: reconcile defaults: {error}");
     }
+    // This one loop is BOTH the fallback and the reclaim, and that is why there is no second code
+    // path for either. Every pass it asks where each stream's remembered intent can actually go
+    // right now, and relinks only when that answer has changed. A peer going away changes it one
+    // way; the same peer coming back changes it the other. Nobody presses anything.
+    //
+    // The old guard here required every remembered target to be present before touching links,
+    // which meant that losing a peer was precisely the case it refused to act on: PipeWire had
+    // already destroyed the links, and the stream fell silent with its route still "set".
     for stream in &graph.snapshot.streams {
-        let targets = if !stream.explicit_targets.is_empty() {
-            Some(stream.explicit_targets.as_slice())
+        let wanted: Vec<String> = if stream.explicit_targets.is_empty() {
+            graph.snapshot.default_output.clone().into_iter().collect()
         } else {
-            graph
-                .snapshot
-                .default_output
-                .as_ref()
-                .map(std::slice::from_ref)
+            stream.explicit_targets.clone()
         };
-        if let Some(targets) = targets {
-            if stream.targets != targets && targets.iter().all(|target| graph.has_endpoint(target))
-            {
-                if let Err(error) = graph.apply_route(&stream.id, targets) {
-                    eprintln!("nixaudiod: reconcile {}: {error}", stream.application);
-                }
-            }
+        if wanted.is_empty() {
+            continue;
+        }
+        let mut effective = graph.resolve(&wanted);
+        effective.sort();
+        if effective.is_empty() || stream.targets == effective {
+            continue;
+        }
+        if let Err(error) = graph.apply_route(&stream.id, &effective) {
+            eprintln!("nixaudiod: reconcile {}: {error}", stream.application);
         }
     }
     *published.write().unwrap() = graph.local_manifest();

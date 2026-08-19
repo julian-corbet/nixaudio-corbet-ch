@@ -422,7 +422,14 @@ impl Graph {
                         .into(),
                     location: peer.clone(),
                     label: format!("{} · {}", peer, manifest.label),
-                    available: target_ports.len() == slice.channels.len(),
+                    // BOTH halves, and the conjunction is the point. The port count is a
+                    // media-plane fact about OUR process; `remote.available` is a control-plane
+                    // fact about THEIRS. Ports outlive the peer -- they vanish only when JackTrip
+                    // itself exits, ten seconds after media stops -- so port count alone reports a
+                    // dead destination as usable, which is how every endpoint on this fleet read
+                    // `available: true` while nothing had ever carried a packet.
+                    available: remote.available
+                        && target_ports.len() == slice.channels.len(),
                     volume: 1.0,
                     muted: false,
                     pipewire_id: jacktrip.map(|node| node.id),
@@ -507,8 +514,11 @@ impl Graph {
                         .map(|peer| peer.address.clone())
                         .or_else(|| configured.addresses.first().cloned())
                         .unwrap_or_default(),
+                    // "Can sound go there right now" -- the peer answers AND we hold a session
+                    // for it. Either half alone is a half-truth a user would act on.
                     available: current.is_some_and(|peer| {
-                        nodes.values().any(|node| node.name == peer.plan.node_name)
+                        peer.available
+                            && nodes.values().any(|node| node.name == peer.plan.node_name)
                     }),
                 }
             })
@@ -737,6 +747,54 @@ impl Graph {
             .get(stream)
             .map(String::as_str)
             .ok_or_else(|| anyhow!("unknown stream {stream}"))
+    }
+
+    /// Turn remembered intent into the destinations sound can actually reach right now.
+    ///
+    /// This is the whole of route fallback and route reclaim, and it is deliberately one function
+    /// with no state of its own. Intent lives in `state.json` and is never rewritten here: the
+    /// moment a fallback is written down it BECOMES the intent, and the route can never come back.
+    ///
+    /// Partial credit is on purpose. A stream pinned to two destinations with one of them away
+    /// keeps the survivor and does not also gain the default, which would double-route it.
+    /// Everything terminates: the default output has already been filtered to something available
+    /// and local, so the recursion is one step deep by construction.
+    pub fn resolve(&self, wanted: &[String]) -> Vec<String> {
+        let live: Vec<String> = wanted
+            .iter()
+            .filter(|id| self.is_usable(id))
+            .cloned()
+            .collect();
+        if !live.is_empty() {
+            return live;
+        }
+        // Losing a peer must never mean losing the sound. Somewhere audible here is the answer.
+        self.snapshot.default_output.clone().into_iter().collect()
+    }
+
+    /// Whether an endpoint can carry audio at this instant. One definition, so a route, a default
+    /// and the tray cannot disagree about what "available" means.
+    pub fn is_usable(&self, endpoint: &str) -> bool {
+        self.snapshot
+            .outputs
+            .iter()
+            .any(|candidate| candidate.id == endpoint && candidate.available)
+            && self
+                .endpoint_ports
+                .get(endpoint)
+                .is_some_and(|ports| !ports.is_empty())
+    }
+
+    /// Whether this id names something the user is ALLOWED to pin to -- a local endpoint that
+    /// exists, or any endpoint on a configured peer. Deliberately weaker than `is_usable`: pinning
+    /// to a peer that is currently asleep has to be legal, or intent could never outlive an outage.
+    pub fn is_addressable(&self, config: &Config, endpoint: &str) -> bool {
+        if self.endpoint_ports.contains_key(endpoint) {
+            return true;
+        }
+        endpoint
+            .split_once('.')
+            .is_some_and(|(location, _)| config.peers.contains_key(location))
     }
 
     pub fn has_endpoint(&self, endpoint: &str) -> bool {
@@ -1009,6 +1067,8 @@ mod tests {
                     address: "beta.local".into(),
                     manifest,
                     plan,
+                    available: true,
+                    misses: 0,
                 },
             )]),
         };

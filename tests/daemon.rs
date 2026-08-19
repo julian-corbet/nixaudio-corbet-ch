@@ -301,3 +301,108 @@ fn losing_a_peer_degrades_health_without_disturbing_local_audio() {
         world.calls_matching("pw-link -d")
     );
 }
+
+/// The behaviour the product promises, and the defect that made it impossible.
+///
+/// A JackTrip process outlives its peer by design: upstream's `--timeout` gives it ten seconds of
+/// silence before it exits, so its ports are still sitting in the local graph when the peer is
+/// already gone. Deciding whether a destination is reachable from those ports therefore reports a
+/// corpse as usable, and the stream plays into it — which is exactly what the whole fleet did,
+/// every endpoint `available: true` while nothing had ever carried a packet.
+///
+/// So this test keeps the JackTrip node staged throughout. Only the PEER goes away. The fallback
+/// has to fire anyway, and the route has to come back on its own when the peer does.
+#[test]
+fn a_pinned_route_falls_back_and_reclaims_while_the_jacktrip_node_never_moves() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    // Stage the peer's session and leave it staged for the rest of the test. Nothing below ever
+    // removes it, so no assertion here can be satisfied by the node disappearing.
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+    world.until("beta to be usable", |snapshot| {
+        snapshot["outputs"]
+            .as_array()
+            .is_some_and(|outputs| outputs.iter().any(|o| o["id"] == "beta.hyperx" && o["available"] == true))
+    });
+
+    world
+        .ctl(&["route", "stream:200", "beta.hyperx"])
+        .expect("pin the stream across the fabric");
+    world.until_calls("the stream to be linked to beta's send ports", |calls| {
+        calls.iter().any(|call| call == "pw-link 21 51")
+    });
+
+    // Every assertion below is against calls made AFTER the event that should have caused them.
+    // Searching the whole log instead would have been satisfied by the startup routing, which links
+    // this very stream to this very sink before any peer is involved -- a test that passes against
+    // the bug it was written to catch.
+    let before_outage = world.calls().len();
+
+    // The peer stops answering. Its ports remain exactly where they were.
+    peer.silence();
+    let fell_back = world.until_calls("the sound to fall back to somewhere audible here", |calls| {
+        calls[before_outage..].iter().any(|call| call == "pw-link 21 11")
+    });
+    assert!(
+        fell_back[before_outage..]
+            .iter()
+            .any(|call| call == "pw-link 22 12"),
+        "both channels followed, not just the first: {:#?}",
+        &fell_back[before_outage..]
+    );
+    assert_eq!(
+        world.persisted_state().unwrap()["routes"]["firefox|Music"],
+        json!(["beta.hyperx"]),
+        "the REMEMBERED route is still beta. A fallback that rewrites intent can never be undone, \
+         and the peer would never get its stream back"
+    );
+
+    // ...and the same member returns, on the same address, with nobody pressing anything.
+    let before_return = world.calls().len();
+    peer.come_back();
+    world.until_calls("the route to be reclaimed by itself", |calls| {
+        calls[before_return..]
+            .iter()
+            .any(|call| call == "pw-link 21 51")
+    });
+}
+
+/// Intent has to be expressible while its destination is asleep, or it could never outlive an
+/// outage — and a laptop that is shut at night is the ordinary case, not the exception.
+#[test]
+fn a_route_to_a_peer_that_is_not_answering_is_still_accepted_and_persisted() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let port = peer.port;
+    peer.silence();
+
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": port, "audioPort": 46001 } }),
+    );
+
+    world
+        .ctl(&["route", "stream:200", "beta.hyperx"])
+        .expect("a route to a configured peer is accepted even while it is away");
+    assert_eq!(
+        world.persisted_state().unwrap()["routes"]["firefox|Music"],
+        json!(["beta.hyperx"]),
+        "and it is remembered verbatim, waiting to be honoured"
+    );
+    world.until_calls("the sound to go somewhere audible meanwhile", |calls| {
+        calls.iter().any(|call| call == "pw-link 21 11")
+    });
+
+    let error = world
+        .ctl(&["route", "stream:200", "gamma.hyperx"])
+        .expect_err("but a peer that is not in the circle at all is still refused");
+    assert!(error.contains("unknown output"), "{error}");
+}
