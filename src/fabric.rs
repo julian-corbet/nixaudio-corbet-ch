@@ -1,4 +1,4 @@
-use crate::config::{Config, PeerConfig, TransportConfig};
+use crate::config::{Config, PeerConfig, ResolvedTransport};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -187,7 +187,7 @@ pub fn plan(
     })
 }
 
-fn arguments(plan: &SessionPlan, transport: &TransportConfig) -> Vec<String> {
+fn arguments(plan: &SessionPlan, transport: &ResolvedTransport) -> Vec<String> {
     let mut args = match plan.role {
         Role::Server => vec!["--server".into()],
         Role::Client => vec!["--client".into(), plan.address.clone()],
@@ -211,10 +211,9 @@ fn arguments(plan: &SessionPlan, transport: &TransportConfig) -> Vec<String> {
         "--bitres".into(),
         transport.bit_resolution.to_string(),
         "--queue".into(),
-        transport.queue.to_string(),
+        transport.queue.argument(),
         "--redundancy".into(),
         transport.redundancy.to_string(),
-        "--zerounderrun".into(),
         "--bufstrategy".into(),
         "3".into(),
         "--udprt".into(),
@@ -223,9 +222,9 @@ fn arguments(plan: &SessionPlan, transport: &TransportConfig) -> Vec<String> {
     args
 }
 
-fn worker_spec(plan: &SessionPlan, transport: &TransportConfig) -> WorkerSpec {
+fn worker_spec(plan: &SessionPlan, command: &[String], transport: &ResolvedTransport) -> WorkerSpec {
     WorkerSpec {
-        command: transport.command.clone(),
+        command: command.to_vec(),
         arguments: arguments(plan, transport),
         latency: format!("{}/{}", transport.period, transport.sample_rate),
     }
@@ -333,7 +332,7 @@ impl Runtime {
             local,
             &remote,
         )?;
-        let spec = worker_spec(&plan, &config.transport);
+        let spec = worker_spec(&plan, &config.transport.command, &config.transport_for(name));
 
         let restart = match self.workers.get_mut(name) {
             Some(worker) if worker.spec == spec => worker.child.try_wait()?.is_some(),
@@ -393,6 +392,7 @@ pub async fn serve(config: Config, manifest: Arc<RwLock<Manifest>>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{PeerTransport, TransportConfig};
     use crate::config::ControlConfig;
 
     fn endpoint(id: &str, channels: &[&str]) -> EndpointManifest {
@@ -469,12 +469,25 @@ mod tests {
             send_channels: 4,
             receive_channels: 2,
         };
-        let args = arguments(&plan, &TransportConfig::default());
+        let args = arguments(&plan, &TransportConfig::default().defaults());
         assert!(args.windows(2).any(|v| v == ["--sendchannels", "4"]));
         assert!(args.windows(2).any(|v| v == ["--receivechannels", "2"]));
-        assert!(args.iter().any(|v| v == "--zerounderrun"));
         assert!(args.iter().any(|v| v == "--nojackportsconnect"));
         assert_eq!(args[0], "--client");
+
+        // The buffer is adaptive by default: the Regulator measures this link at packet rate and
+        // floors its headroom at one period, which is the only way to spend the least latency the
+        // path allows rather than a constant chosen for some other path.
+        assert!(args.windows(2).any(|v| v == ["--queue", "auto"]));
+
+        // `--timeout` is load-bearing and must not be tidied away. It is what makes a JackTrip that
+        // has stopped receiving exit, which is what removes its ports from the local graph, which
+        // is one of the two things that lets a pinned route notice its destination is gone.
+        assert!(args.iter().any(|v| v == "--timeout"));
+
+        // `--zerounderrun` cannot do anything here: upstream forces the zero-underrun mode for any
+        // non-negative buffer strategy before it ever reads the flag, and we always send 3.
+        assert!(!args.iter().any(|v| v == "--zerounderrun"));
     }
 
     #[tokio::test]
@@ -533,6 +546,7 @@ mod tests {
                 addresses: vec!["127.0.0.1".into()],
                 control_port,
                 audio_port: 46001,
+                transport: PeerTransport::default(),
             },
         );
         let local = Manifest {
@@ -599,6 +613,7 @@ mod tests {
                 addresses: vec!["127.0.0.1".into()],
                 control_port,
                 audio_port: 46001,
+                transport: PeerTransport::default(),
             },
         );
         let local = Manifest {

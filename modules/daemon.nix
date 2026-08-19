@@ -18,6 +18,9 @@ let
     peers = lib.mapAttrs
       (_: peer: {
         inherit (peer) addresses controlPort audioPort;
+        # Only the overrides this peer actually set. An absent field means "take the host default";
+        # emitting nulls would make the daemon's Option<T> read them as deliberate.
+        transport = lib.filterAttrs (_: value: value != null) peer.transport;
       })
       cfg.fabric.peers;
     catalogue = cfg.fabric.catalogue;

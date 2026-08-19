@@ -73,6 +73,44 @@ in
               multichannel JackTrip process per peer without one process per stream or device.
             '';
           };
+
+          transport = lib.mkOption {
+            type = lib.types.submodule {
+              options = {
+                period = lib.mkOption {
+                  type = lib.types.nullOr lib.types.ints.positive;
+                  default = null;
+                  description = "Override this link's period, in samples.";
+                };
+                bitResolution = lib.mkOption {
+                  type = lib.types.nullOr (lib.types.enum [ 8 16 24 32 ]);
+                  default = null;
+                  description = "Override this link's network sample resolution.";
+                };
+                queue = lib.mkOption {
+                  type = lib.types.nullOr (lib.types.strMatching "auto|auto[0-9]+|[0-9]+");
+                  default = null;
+                  description = "Override this link's `-q`. Same spelling as the host-wide option.";
+                };
+                redundancy = lib.mkOption {
+                  type = lib.types.nullOr lib.types.ints.positive;
+                  default = null;
+                  description = "Override this link's UDP packet redundancy factor.";
+                };
+              };
+            };
+            default = { };
+            description = ''
+              Per-link overrides of the host-wide `transport` defaults. `null` means "take the
+              default", never "zero".
+
+              These four are properties of a LINK, not of this host: there is exactly one JackTrip
+              process per peer pair, so a value that suits a peer on the same switch is the wrong
+              value for one on a hotspot, and a circle has both at once. Only `command` and
+              `sampleRate` stay host-wide, because PipeWire runs one graph at one clock and there is
+              physically only one of each to have.
+            '';
+          };
         };
       });
       default = { };
@@ -95,8 +133,10 @@ in
         default = [ ];
         internal = true;
         description = ''
-          Plane-specific JackTrip command prefix. The NixOS projection uses its matching pw-jack;
-          the system-manager/Home Manager projections use the foreign distribution's pw-jack.
+          Plane-specific JackTrip command prefix. Every plane uses nixpkgs' own pw-jack, matched
+          to the Nix-built JackTrip it redirects -- including on a foreign distribution, where the
+          sound server is the distro's but the JACK shim cannot be. See system-manager/default.nix
+          for why that boundary falls where it does.
         '';
       };
 
@@ -119,9 +159,24 @@ in
       };
 
       queue = lib.mkOption {
-        type = lib.types.ints.unsigned;
-        default = 4;
-        description = "JackTrip receive queue length in packets; JackTrip requires at least two.";
+        type = lib.types.strMatching "auto|auto[0-9]+|[0-9]+";
+        default = "auto";
+        example = "auto20";
+        description = ''
+          JackTrip's `-q`, as JackTrip spells it.
+
+          `"auto"` lets the Regulator choose the headroom and keep re-choosing it from the link it
+          is actually on, floored at one period. That is the default because it is the only setting
+          that spends the least latency a path allows instead of a constant chosen for some other
+          path -- and in a circle of a dozen members, some peer is always on a worse link than the
+          one a constant was picked for. `"auto<N>"` seeds that adaptation with N milliseconds.
+
+          A bare number is a FIXED tolerance in MILLISECONDS with adaptation switched off -- not a
+          count of packets, whatever this option used to say. Under `--bufstrategy 3`, which is the
+          only strategy nixaudio emits, upstream reads it that way: "mBufferQueueLength is in
+          integer msec not packets". The old `4` therefore bought four milliseconds, less than two
+          128-frame periods at 48 kHz, and could not absorb a single late packet.
+        '';
       };
 
       redundancy = lib.mkOption {
@@ -157,9 +212,33 @@ in
       assertion = cfg.transport.command != [ ];
       message = "the active deployment plane did not provide nixaudio.fabric.transport.command.";
     }
-    {
-      assertion = cfg.transport.queue >= 2;
-      message = "nixaudio.fabric.transport.queue must be at least two packets.";
-    }
-  ];
+  ] ++ lib.optionals cfg.enable (
+    # A fixed tolerance below two period durations cannot absorb one late packet, so it guarantees
+    # the glitching it was meant to prevent. Adaptive spellings are exempt: the Regulator floors its
+    # own headroom at a period. Checked per link, because `period` is now a per-link property.
+    let
+      fixedMs = queue: if builtins.match "[0-9]+" queue != null then lib.toInt queue else null;
+      floorMs = period: (2000 * period + cfg.transport.sampleRate - 1) / cfg.transport.sampleRate;
+      links = [{ name = "transport"; inherit (cfg.transport) queue period; }]
+        ++ lib.mapAttrsToList
+          (name: peer: {
+            name = "peers.${name}.transport";
+            queue = if peer.transport.queue != null then peer.transport.queue else cfg.transport.queue;
+            period = if peer.transport.period != null then peer.transport.period else cfg.transport.period;
+          })
+          cfg.peers;
+    in
+    map
+      (link: {
+        assertion = let ms = fixedMs link.queue; in ms == null || ms >= floorMs link.period;
+        message = ''
+          nixaudio.fabric.${link.name}.queue is ${link.queue} ms of FIXED jitter tolerance, below
+          the ${toString (floorMs link.period)} ms that two periods of ${toString link.period}
+          frames at ${toString cfg.transport.sampleRate} Hz occupy. Under bufstrategy 3 that number
+          is milliseconds, not packets, and adaptation is off. Use "auto" unless you have measured
+          this link.
+        '';
+      })
+      links
+  );
 }

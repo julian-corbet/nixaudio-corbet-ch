@@ -973,6 +973,7 @@ mod tests {
                 addresses: vec!["beta.local".into()],
                 control_port: 45900,
                 audio_port: 46001,
+                transport: crate::config::PeerTransport::default(),
             },
         );
         let manifest = Manifest {
