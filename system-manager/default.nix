@@ -28,7 +28,7 @@
 # for that daemon, or a firmware image the kernel loads for it, so a half-nixpkgs backend is a
 # split-brain install rather than a partial one. Failing the build names the missing thing exactly;
 # quietly filling it in from nixpkgs would produce a host that mostly works.
-{ lib, config, ... }:
+{ lib, config, pkgs, ... }:
 let
   cfg = config.nixaudio;
 in
@@ -60,9 +60,41 @@ in
         cfg.guard.wireplumberConfig;
     })
 
+    # ── THE JACK SHIM IS NIX'S, EVEN THOUGH THE SOUND SERVER IS THE DISTRO'S ────────────────────
+    #
+    # Everywhere else this plane defers to the distro, because the distro's copy is the one that
+    # runs. `pw-jack` is the exception, and the reason is an ABI boundary rather than a preference.
+    #
+    # JackTrip here is the Nix-built binary from `transport.package`. Its RUNPATH names Nix's real
+    # libjack2, so the loader resolves `libjack.so.0` inside the store and JackTrip talks to a JACK
+    # SERVER that is not running -- "Cannot connect to server socket". `pw-jack` exists to redirect
+    # that lookup at PipeWire's implementation, and it does it by prepending a directory to
+    # LD_LIBRARY_PATH, which only works when that directory holds an ABI-compatible libjack.
+    #
+    # Arch's /usr/bin/pw-jack cannot do it, and not by accident: Arch's `pipewire-jack` installs its
+    # libjack straight into /usr/lib as the system-wide replacement for jack2 (that is exactly why
+    # the two packages conflict), so the script's LD_LIBRARY_PATH line is COMMENTED OUT upstream in
+    # the Arch build and it `exec "$@"` unchanged. For a distro binary that is correct and needs no
+    # redirect. For ours it is a no-op, verified with ldd both with and without it: the store's
+    # libjack2 wins either way.
+    #
+    # Pointing LD_LIBRARY_PATH at /usr/lib instead would not rescue it. That library is linked
+    # against the distro's glibc and our JackTrip against the store's; glibc is the ABI wall, the
+    # same one that makes a Nix graphical binary need Nix Mesa.
+    #
+    # So the shim comes from nixpkgs, matched to the binary it redirects. This is NOT a second sound
+    # server: `pw-jack` ships no daemon, and libjack speaks the PipeWire protocol to whichever
+    # PipeWire is already listening on the session socket -- the distro's. That boundary is a
+    # protocol, not an ABI, and both ends are PipeWire 1.6.x. Proven live on corbet-archlxc: a Nix
+    # JackTrip under this shim reaches Arch's running PipeWire and reports "Setting JACK Process
+    # Callback... SUCCESS" at 48000/128.
+    #
+    # `pipewire-jack` stays declared in lib/packages.nix all the same. It is not what wires US up;
+    # it is what keeps a real jack2 -- and therefore a real jackd, autostartable by any JACK client
+    # that misses its shim -- off a host whose sound server is PipeWire.
     (lib.mkIf cfg.fabric.enable {
       nixaudio.fabric.transport.command = [
-        "/usr/bin/pw-jack"
+        "${pkgs.pipewire.jack}/bin/pw-jack"
         "${cfg.fabric.transport.package}/bin/jacktrip"
       ];
     })

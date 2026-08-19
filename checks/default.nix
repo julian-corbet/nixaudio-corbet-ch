@@ -133,7 +133,10 @@ in
 
   arch-plane = check "arch-plane" (
     arch.config.nixaudio.fabric.transport.command
-    == [ "/usr/bin/pw-jack" "${arch.config.nixaudio.fabric.transport.package}/bin/jacktrip" ]
+    == [
+      "${pkgs.pipewire.jack}/bin/pw-jack"
+      "${arch.config.nixaudio.fabric.transport.package}/bin/jacktrip"
+    ]
     && arch.config.environment.etc ? "nixaudio/config.json"
     && arch.config.environment.etc ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf"
     && !(arch.config.environment.etc ? "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf")
@@ -142,7 +145,10 @@ in
 
   home-plane = check "home-plane" (
     home.config.nixaudio.fabric.transport.command
-    == [ "/usr/bin/pw-jack" "${home.config.nixaudio.fabric.transport.package}/bin/jacktrip" ]
+    == [
+      "${pkgs.pipewire.jack}/bin/pw-jack"
+      "${home.config.nixaudio.fabric.transport.package}/bin/jacktrip"
+    ]
     && home.config.xdg.configFile ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf"
     && !(home.config.xdg.configFile ? "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf")
     && !(home.config.xdg.configFile ? "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf")

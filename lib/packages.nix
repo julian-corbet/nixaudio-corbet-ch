@@ -38,7 +38,10 @@
       arch = "pipewire-jack";
       nixpkgs = null;
       nixosOption = "services.pipewire.jack.enable";
-      reason = "present JackTrip's JACK ports as ordinary PipeWire ports";
+      # NOT the shim our own JackTrip uses -- that one is nixpkgs', matched to the Nix binary's
+      # ABI (system-manager/default.nix says why). This entry is here to keep jack2, and with it an
+      # autostartable jackd, off a host whose sound server is PipeWire.
+      reason = "keep a competing JACK server off a PipeWire host, and serve the distro's own JACK clients";
     };
     "alsa-utils" = {
       arch = "alsa-utils";

@@ -23,7 +23,7 @@
 # Note home-manager's systemd units use the capitalised `Unit`/`Service`/`Install` shape rather than
 # NixOS's flat `description`/`serviceConfig`/`wantedBy`. That difference is the reason this file
 # exists rather than the NixOS projection being reused.
-{ lib, config, ... }:
+{ lib, config, pkgs, ... }:
 let
   cfg = config.nixaudio;
 
@@ -67,9 +67,14 @@ in
     # failure that follows from both writing.
     { nixaudio.dropIns = lib.mkDefault "user"; }
 
+    # nixpkgs' pw-jack, not the distro's, even here. JackTrip is the Nix-built binary and its
+    # RUNPATH names Nix's real libjack2, so the shim has to be ABI-matched to it or the redirect
+    # does nothing and JackTrip goes looking for a JACK server. Arch's own pw-jack cannot do it at
+    # all -- its LD_LIBRARY_PATH line is commented out, because Arch installs PipeWire's libjack
+    # into /usr/lib as the system-wide one. ../system-manager/default.nix carries the full reasoning.
     (lib.mkIf cfg.fabric.enable {
       nixaudio.fabric.transport.command = [
-        "/usr/bin/pw-jack"
+        "${pkgs.pipewire.jack}/bin/pw-jack"
         "${cfg.fabric.transport.package}/bin/jacktrip"
       ];
     })
