@@ -150,7 +150,12 @@ impl AudioTray {
     }
 
     fn stream_menu(stream: &Stream, outputs: &[Endpoint]) -> MenuItem<Self> {
-        let selected: BTreeSet<&str> = stream.targets.iter().map(String::as_str).collect();
+        // Ticks show INTENT, never the links that happen to exist. `targets` is where the sound is
+        // going right now, which for a stream following the default is the default, and for a
+        // stream whose destination is away is the fallback. Ticking from that meant a click either
+        // pinned the default the user had never chosen, or -- once routes started falling back --
+        // silently rewrote the pin to wherever the outage had pushed it.
+        let selected: BTreeSet<&str> = stream.explicit_targets.iter().map(String::as_str).collect();
         let mut items: Vec<MenuItem<Self>> = outputs
             .iter()
             .map(|endpoint| {
@@ -190,13 +195,22 @@ impl AudioTray {
             }
             .into(),
         );
+        // When effect and intent disagree -- a pinned peer is away and the sound is falling back
+        // here -- say so on the label. The alternative is a ticked box and sound coming out
+        // somewhere else, with nothing on screen admitting it.
+        let mut label = format!(
+            "{} · {}% · {}",
+            stream.application,
+            (stream.volume * 100.0).round(),
+            stream.title
+        );
+        if !stream.explicit_targets.is_empty() && stream.targets != stream.explicit_targets {
+            if let Some(actual) = stream.targets.first() {
+                label.push_str(&format!("  (on {actual})"));
+            }
+        }
         SubMenu {
-            label: format!(
-                "{} · {}% · {}",
-                stream.application,
-                (stream.volume * 100.0).round(),
-                stream.title
-            ),
+            label,
             submenu: items,
             ..Default::default()
         }
@@ -450,7 +464,12 @@ async fn run_backend(
                         Action::Route { stream, target, enabled } => {
                             let json = proxy.inspect().await?;
                             let snapshot: Snapshot = serde_json::from_str(&json)?;
-                            let mut targets: BTreeSet<String> = snapshot.streams.iter().find(|v| v.id == stream).map(|v| v.targets.iter().cloned().collect()).unwrap_or_default();
+                            // Amend the INTENT, not the effect. Reading `targets` here meant that
+                            // ticking one remote output on a stream that was merely following the
+                            // default pinned BOTH, and that ticking anything at all while a pinned
+                            // peer was away replaced the pin with the fallback -- losing the route
+                            // the user actually set, permanently and silently.
+                            let mut targets: BTreeSet<String> = snapshot.streams.iter().find(|v| v.id == stream).map(|v| v.explicit_targets.iter().cloned().collect()).unwrap_or_default();
                             if enabled { targets.insert(target); } else { targets.remove(&target); }
                             if targets.is_empty() { proxy.clear_route(&stream).await } else { proxy.route(&stream, &targets.into_iter().collect::<Vec<_>>()).await }
                         }

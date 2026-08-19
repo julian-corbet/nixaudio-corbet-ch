@@ -349,16 +349,14 @@ fn a_pinned_route_falls_back_and_reclaims_while_the_jacktrip_node_never_moves() 
 
     // The peer stops answering. Its ports remain exactly where they were.
     peer.silence();
-    let fell_back = world.until_calls("the sound to fall back to somewhere audible here", |calls| {
-        calls[before_outage..].iter().any(|call| call == "pw-link 21 11")
+    // Wait for BOTH channels. `apply_route` links them as two separate `pw-link` invocations, so a
+    // predicate satisfied by the first one races the second and fails intermittently on the
+    // assertion below -- which is a test that reports a product failure it did not observe.
+    world.until_calls("the sound to fall back to somewhere audible here", |calls| {
+        let since = &calls[before_outage..];
+        since.iter().any(|call| call == "pw-link 21 11")
+            && since.iter().any(|call| call == "pw-link 22 12")
     });
-    assert!(
-        fell_back[before_outage..]
-            .iter()
-            .any(|call| call == "pw-link 22 12"),
-        "both channels followed, not just the first: {:#?}",
-        &fell_back[before_outage..]
-    );
     assert_eq!(
         world.persisted_state().unwrap()["routes"]["firefox|Music"],
         json!(["beta.hyperx"]),
@@ -370,9 +368,9 @@ fn a_pinned_route_falls_back_and_reclaims_while_the_jacktrip_node_never_moves() 
     let before_return = world.calls().len();
     peer.come_back();
     world.until_calls("the route to be reclaimed by itself", |calls| {
-        calls[before_return..]
-            .iter()
-            .any(|call| call == "pw-link 21 51")
+        let since = &calls[before_return..];
+        since.iter().any(|call| call == "pw-link 21 51")
+            && since.iter().any(|call| call == "pw-link 22 52")
     });
 }
 
