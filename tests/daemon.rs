@@ -536,3 +536,46 @@ fn a_graph_that_cannot_be_read_is_reported_as_an_error_not_served_silently() {
         snapshot["health"]["status"] == "ok"
     });
 }
+
+/// A daemon that refuses to exist without a graph turns a transient into an outage.
+///
+/// `pw-dump` runs under a six second timeout. On corbet-server at load average 17 it lost that
+/// race, the daemon exited, systemd restarted it straight into the same timeout, and the loop held
+/// for as long as the load did — no daemon, nothing bound, both JackTrip legs gone, over a command
+/// that would have succeeded a minute later.
+///
+/// Starting degraded is strictly better than not starting: the daemon is present, it says exactly
+/// what is wrong, and it recovers by itself when the graph reads.
+#[test]
+fn a_daemon_that_cannot_read_the_graph_at_startup_starts_anyway_and_recovers() {
+    let world = World::local_starting_blind(one_sink_and_firefox("A useful tab"));
+
+    let blind = world.until("the daemon to answer at all", |snapshot| {
+        snapshot["health"]["status"] == "error"
+    });
+    assert!(
+        blind["health"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("initial graph read failed"),
+        "it names the reason rather than dying silently: {}",
+        blind["health"]["message"]
+    );
+    assert_eq!(
+        blind["outputs"], json!([]),
+        "and it claims no devices, which is true, rather than inventing any"
+    );
+
+    world.mend_graph_source();
+    let recovered = world.until("it to pick the graph up by itself", |snapshot| {
+        snapshot["health"]["status"] == "ok"
+    });
+    assert!(
+        recovered["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|output| output["id"] == "local.hyperx.analog-stereo"),
+        "with no restart and nobody intervening"
+    );
+}

@@ -51,10 +51,14 @@ PipeWire performs the actual n-to-n mixing at both ends.
 | Per-stream n-to-n routing | native `pw-link` links; remembered by application/media intent rather than volatile node ID |
 | Local defaults, volume and mute | implemented through `wpctl` |
 | Cross-host output discovery | live peer manifests; no evaluation-time guesses or fake sinks |
-| Cross-host media | pinned upstream JackTrip 3.0.0 through PipeWire's JACK compatibility layer |
+| Cross-host media | pinned upstream JackTrip 3.0.0 through PipeWire's JACK compatibility layer; proven end to end between two hosts |
 | Multiplexing | one asymmetric multichannel connection per peer, with deterministic endpoint slices |
-| Address failover | ordered peer address lists; the first answering control address is used |
-| Process failover | dead, changed or stale JackTrip workers are restarted or removed by reconciliation |
+| Per-link transport tuning | period, sample resolution, queue depth and packet redundancy are properties of one peer link, not of the host, because a peer on the same switch and a peer on a hotspot need different answers at the same time. `queue` defaults to `auto`, which lets JackTrip's Regulator size the buffer from the link it observes instead of a fixed tolerance |
+| A peer that comes and goes | presence belongs to the PEER, not to a transport process: an endpoint is usable only while its peer answers and a session for it is held. Going away takes three consecutive missed probes, about six seconds, so a control-plane blip is not an outage; coming back takes one answer |
+| Routes that outlive an outage | a route is remembered as intent and the intent is never overwritten. While its destination is away the stream plays on something audible here, and it reclaims the destination unprompted when the peer returns. A remembered default output follows the same rule |
+| Reaching a peer that moved | the peer's declared addresses are tried until one answers, and the media session follows to that address with the peer's name, endpoints and routes unchanged. One LAN is the only proven ground; roaming, NAT traversal and relaying are not claimed |
+| Process supervision | JackTrip workers that died, whose command changed, or whose peer left the configuration are restarted or reaped on every pass; one that refuses to stay up is retried with a growing pause rather than respawned in a loop |
+| Health | a single status that can genuinely go red: `error` while the daemon cannot read the PipeWire graph and is therefore serving a snapshot about the past, or while the host has no local devices at all; `degraded` while a peer cannot carry audio. A declared device that is currently plugged into a different host is reported as absent, not as a fault — the same declaration is deliberately made on every host the hardware can roam to |
 | Frontend | tray defaults, stream volume/mute, route checkboxes and peer state |
 | Remote output level control | not yet; levels remain stream-local in this slice |
 | Remote microphone consumption | manifested but not yet exposed as a local capture target |
@@ -78,6 +82,9 @@ The session D-Bus service is `ch.corbet.NixAudio2`, object `/ch/corbet/NixAudio2
 | `SetVolume(object, value)` | set local stream or endpoint volume from `0.0` through `1.5` |
 | `SetMuted(object, bool)` | set local stream or endpoint mute |
 | `Changed(revision)` | notify clients after a semantic graph change |
+
+Pinning a stream to a peer that is currently asleep is legal, and deliberately so: a route the user
+set is intent, and intent that could not outlive an outage would be a live link with a longer name.
 
 ```bash
 nixaudioctl inspect
@@ -115,6 +122,11 @@ nixaudioctl mute stream:123 on
 }
 ```
 
+`control.port` defaults to 26300. `audioPort` has no default and belongs to the unordered peer
+PAIR: both ends declare the same number, and each host gives every peer a distinct one, which is
+what allows one independently supervised JackTrip process per peer. `transport.period`,
+`bitResolution`, `queue` and `redundancy` may be set host-wide and overridden per peer.
+
 An Arch host composes the system-manager and Home Manager planes. The system plane writes
 `/etc/nixaudio/config.json`; Home Manager points its user service at it:
 
@@ -122,16 +134,28 @@ An Arch host composes the system-manager and Home Manager planes. The system pla
 nixaudio.daemon.externalConfigPath = "/etc/nixaudio/config.json";
 ```
 
-The Arch service uses `/usr/bin/pw-jack` so JackTrip enters the distro PipeWire graph. NixOS uses
-the matching `pkgs.pipewire.jack` wrapper. JackTrip remains an upstream source build pinned by hash;
-it is not vendored or forked.
+Every plane runs JackTrip under nixpkgs' own `pw-jack`, including on a foreign distribution. The
+shim exists only to redirect a `libjack.so.0` lookup, so it has to match the binary it redirects:
+this JackTrip is Nix-built and its RUNPATH names Nix's libjack2. A distribution that installs
+PipeWire's libjack into `/usr/lib` as the system-wide replacement for jack2 ships a `pw-jack` with
+its `LD_LIBRARY_PATH` line commented out — correct for its own binaries, a no-op for ours. This is
+not a second sound server: `pw-jack` ships no daemon, and libjack speaks the PipeWire protocol to
+whichever PipeWire already holds the session socket — the distribution's. JackTrip itself remains an
+upstream source build pinned by hash; it is not vendored or forked.
 
 ## Security boundary
 
 The control manifest protocol and classic JackTrip P2P UDP media are currently unauthenticated and
-unencrypted. Bind and firewall them to a trusted LAN. The next transport milestone is pairing plus
-authenticated, encrypted sessions; it must preserve the semantic API and can replace the connection
-adapter without replacing the UI or local PipeWire graph.
+unencrypted. Bind and firewall them to a trusted LAN: control is one TCP port per host on an address
+the deployment names, and media is one UDP port per peer pair.
+
+Keep those ports below the kernel's default ephemeral floor of 32768 — 26300 upward in the reference
+deployment. A port inside that range is one the kernel may hand to any process that asks for "any
+port", and if it does so before the daemon binds, the host silently drops out of its circle.
+
+The next transport milestone is pairing plus authenticated, encrypted sessions; it must preserve the
+semantic API and can replace the connection adapter without replacing the UI or local PipeWire
+graph.
 
 ## Verification
 

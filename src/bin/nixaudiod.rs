@@ -275,8 +275,25 @@ async fn main() -> Result<()> {
     let state_path = state_path();
     let state = State::load(&state_path)?;
     let initial_fabric = fabric::Snapshot::default();
-    let graph = Graph::inspect(&config, &state, &initial_fabric, 1)
-        .context("inspect initial PipeWire graph")?;
+    // A failed FIRST graph read must not be fatal, and this used to be. `pw-dump` runs under a six
+    // second timeout; on a loaded host it loses that race, the daemon exited, systemd restarted it
+    // straight back into the same timeout, and the loop held for as long as the load did. Observed
+    // on corbet-server at load average 17: no daemon, no sockets bound, both JackTrip legs gone --
+    // a transient became an outage because the process refused to exist without a graph.
+    //
+    // Starting with an empty snapshot marked `error` is strictly better. The refresh loop retries
+    // every couple of seconds and clears it the moment the graph reads, and until then the daemon
+    // is present and says exactly what is wrong instead of being absent and saying nothing.
+    let (graph, stale) = match Graph::inspect(&config, &state, &initial_fabric, 1) {
+        Ok(graph) => (graph, None),
+        Err(error) => {
+            eprintln!("nixaudiod: initial graph read failed, starting degraded: {error:#}");
+            (
+                Graph::empty(&config, 1),
+                Some(format!("initial graph read failed: {error}")),
+            )
+        }
+    };
     let published = Arc::new(RwLock::new(graph.local_manifest()));
     let (events_tx, mut events_rx) = mpsc::channel(32);
     let controller = Controller {
@@ -287,7 +304,7 @@ async fn main() -> Result<()> {
             fabric: initial_fabric,
             graph,
             revision: 1,
-            stale: None,
+            stale,
         })),
         refresh: events_tx.clone(),
     };

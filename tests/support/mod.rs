@@ -97,6 +97,16 @@ impl World {
         .started(false)
     }
 
+    /// Start a daemon whose PipeWire refuses to answer from the very first read, as a host under
+    /// enough load that `pw-dump` loses its timeout before anything has ever succeeded.
+    pub fn local_starting_blind(graph: Value) -> Self {
+        let world = Self::new(graph, |config| {
+            config["peers"] = json!({});
+        });
+        std::fs::write(world.graph_path.with_extension("json.broken"), b"").unwrap();
+        world.started(true)
+    }
+
     fn new(graph: Value, customise: impl FnOnce(&mut Value)) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().to_path_buf();

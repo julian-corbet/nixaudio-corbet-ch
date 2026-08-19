@@ -219,6 +219,23 @@ impl Graph {
         Self::from_values(&values, config, state, fabric, revision)
     }
 
+    /// A graph for a host whose PipeWire has not answered yet.
+    ///
+    /// Deliberately built from `from_values` with no nodes rather than hand-assembled: every field
+    /// then has the same shape it always has, so nothing downstream needs a special case for it,
+    /// and it cannot drift as the snapshot grows. The health it reports is the honest one -- no
+    /// local devices -- and the caller overrides it with the reason it could not read.
+    pub fn empty(config: &Config, revision: u64) -> Self {
+        Self::from_values(
+            &[],
+            config,
+            &State::default(),
+            &FabricSnapshot::default(),
+            revision,
+        )
+        .expect("an empty graph cannot fail to build")
+    }
+
     pub fn from_values(
         values: &[Value],
         config: &Config,
