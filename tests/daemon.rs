@@ -404,3 +404,135 @@ fn a_route_to_a_peer_that_is_not_answering_is_still_accepted_and_persisted() {
         .expect_err("but a peer that is not in the circle at all is still refused");
     assert!(error.contains("unknown output"), "{error}");
 }
+
+/// A worker that starts perfectly and then exits is the failure the supervisor cannot see from the
+/// spawn, because the spawn succeeded. JackTrip does exactly this when its UDP port is already
+/// bound — which is a live hazard, since the audio ports sit inside the kernel's ephemeral range.
+///
+/// Observed on corbet-archlxc at 04:39 today: one healthy daemon respawning both of its JackTrip
+/// children every couple of seconds, indefinitely, because the backoff only covered commands that
+/// could not be executed at all. The cost is a log flood and a spawn storm against a condition
+/// that retrying cannot fix.
+#[test]
+fn a_worker_that_exits_at_once_is_backed_off_rather_than_respawned_forever() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let port = peer.port;
+    let world = World::with_peers_running(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": port, "audioPort": 46001 } }),
+        "jacktrip-that-quits",
+    );
+
+    world.until_calls("the first attempt", |calls| {
+        calls.iter().any(|call| call.starts_with("jacktrip "))
+    });
+
+    // Watch a window several reconcile passes wide. Unthrottled, this respawns once per 2 s pass;
+    // throttled, the pauses double away from that almost immediately.
+    let first = world.calls_matching("jacktrip ").len();
+    std::thread::sleep(std::time::Duration::from_secs(12));
+    let attempts = world.calls_matching("jacktrip ").len();
+    let during_window = attempts - first;
+
+    assert!(
+        during_window <= 3,
+        "a doomed worker was retried {during_window} times in 12 s; unthrottled that is ~6 and \
+         never stops. Backoff is not covering a process that execs and then exits."
+    );
+
+    // ...and it must still be the peer's own problem, not the host's. The daemon answers, the local
+    // graph is intact, and the peer is reported unusable rather than quietly counted as fine --
+    // it answers on the control plane but has no session, so sound cannot go there.
+    let snapshot = world.inspect();
+    assert_ne!(
+        snapshot["health"]["status"], "error",
+        "one dead worker is not a dead host: {}",
+        snapshot["health"]
+    );
+    assert!(
+        snapshot["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|output| output["id"] == "local.hyperx.analog-stereo"
+                && output["available"] == true),
+        "the local sink is untouched by a peer that cannot carry audio"
+    );
+    assert_eq!(
+        snapshot["peers"][0]["available"],
+        json!(false),
+        "a peer whose session will not stay up is not available, whatever its control plane says"
+    );
+}
+
+/// A declared device that is not plugged in HERE is a naming rule that has not matched, not a
+/// fault. The same declaration is deliberately made on every host the hardware can roam to, so
+/// counting its absence as degradation left two of three machines permanently red over a headset
+/// sitting in the third one's USB port — and a status that is always red says as little as one
+/// that is always green.
+#[test]
+fn a_declared_device_that_is_not_plugged_in_here_is_not_a_fault() {
+    let world = World::local_with_catalogue(
+        one_sink_and_firefox("A useful tab"),
+        // `shure` deliberately, not `hyperx`: the staged graph HAS a hyperx sink, so declaring that
+        // one would prove nothing about absence.
+        json!({
+            "shure": { "origin": "local", "peer": null, "device": "shure",
+                       "description": "Shure MV5C", "known": "declared" }
+        }),
+    );
+
+    let snapshot = world.inspect();
+    assert_eq!(
+        snapshot["health"]["status"], "ok",
+        "a roaming device that is elsewhere is not this host's fault: {}",
+        snapshot["health"]
+    );
+    // It is still reported — as absent, which is what it is.
+    assert!(
+        snapshot["unavailable_devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["id"] == "local.shure"),
+        "the absence is still published for a UI to show: {}",
+        snapshot["unavailable_devices"]
+    );
+}
+
+/// Health has to be able to go red, or it is decoration. On a host with virtual ALSA devices the
+/// old "no local devices" condition is unreachable by design — snd-dummy guarantees a device — so
+/// the only fault this daemon can always detect about itself is that it can no longer read the
+/// graph at all. Then every field it is serving is a claim about the past, and it must say so
+/// rather than keep answering confidently from a stale snapshot.
+#[test]
+fn a_graph_that_cannot_be_read_is_reported_as_an_error_not_served_silently() {
+    let world = World::local(one_sink_and_firefox("A useful tab"));
+    assert_eq!(world.inspect()["health"]["status"], "ok");
+
+    world.break_graph_source();
+    let broken = world.until("the daemon to admit it is stale", |snapshot| {
+        snapshot["health"]["status"] == "error"
+    });
+    assert!(
+        broken["health"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stale"),
+        "it says why: {}",
+        broken["health"]["message"]
+    );
+    assert!(
+        broken["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|output| output["id"] == "local.hyperx.analog-stereo"),
+        "and it keeps serving the last good snapshot rather than an empty one"
+    );
+
+    world.mend_graph_source();
+    world.until("the warning to retire once it can read again", |snapshot| {
+        snapshot["health"]["status"] == "ok"
+    });
+}

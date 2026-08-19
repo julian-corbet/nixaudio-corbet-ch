@@ -1,0 +1,7 @@
+#!/bin/sh
+# A JackTrip that execs perfectly and then exits, which is what the real one does when its UDP port
+# is already bound or when it cannot reach a JACK graph. The supervisor cannot learn this from the
+# spawn -- the spawn SUCCEEDED -- only from how briefly the process lived.
+set -eu
+printf 'jacktrip %s\n' "$*" >>"$NIXAUDIO_FAKE_LOG"
+exit 1

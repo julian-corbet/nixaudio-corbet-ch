@@ -25,6 +25,15 @@ struct Runtime {
     fabric: fabric::Snapshot,
     graph: Graph,
     revision: u64,
+    /// Why the last attempt to read the graph failed, if it did.
+    ///
+    /// A failed read does not clear the snapshot -- the last good one is still the best answer we
+    /// have, and throwing it away would turn one bad `pw-dump` into an empty device list. But it
+    /// does mean every field in that snapshot is now a claim about the past, and saying so is the
+    /// one fault this daemon can always detect about itself. Without it `health` cannot go red at
+    /// all on a host with virtual ALSA devices, because the only other error condition is "no local
+    /// devices", which `snd-dummy` makes unreachable by design.
+    stale: Option<String>,
 }
 
 #[derive(Clone)]
@@ -35,9 +44,18 @@ struct Controller {
 
 impl Controller {
     fn inspect(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(
-            &self.inner.read().unwrap().graph.snapshot,
-        )?)
+        let runtime = self.inner.read().unwrap();
+        let mut snapshot = runtime.graph.snapshot.clone();
+        // Applied HERE rather than inside `Graph::inspect`, because `Graph::inspect` is the thing
+        // that failed -- it produced no snapshot to mark. This is the last good one, told the
+        // truth about its own age.
+        if let Some(reason) = &runtime.stale {
+            snapshot.health = nixaudio::graph::Health {
+                status: "error".into(),
+                message: format!("cannot read the audio graph, this snapshot is stale: {reason}"),
+            };
+        }
+        Ok(serde_json::to_string_pretty(&snapshot)?)
     }
     fn route(&self, stream: &str, targets: Vec<String>) -> Result<()> {
         if targets.is_empty() {
@@ -246,6 +264,8 @@ fn refresh(controller: &Controller, published: &Arc<RwLock<fabric::Manifest>>) -
     *published.write().unwrap() = graph.local_manifest();
     runtime.graph = graph;
     runtime.revision = next;
+    // A good read retires the warning; the snapshot is current again.
+    runtime.stale = None;
     Ok(next)
 }
 
@@ -267,6 +287,7 @@ async fn main() -> Result<()> {
             fabric: initial_fabric,
             graph,
             revision: 1,
+            stale: None,
         })),
         refresh: events_tx.clone(),
     };
@@ -332,8 +353,14 @@ async fn main() -> Result<()> {
                 let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
                 AudioService::changed(&emitter, revision).await?;
             }
-            Ok(Err(error)) => eprintln!("nixaudiod: graph refresh: {error}"),
-            Err(error) => eprintln!("nixaudiod: graph worker: {error}"),
+            Ok(Err(error)) => {
+                eprintln!("nixaudiod: graph refresh: {error}");
+                controller.inner.write().unwrap().stale = Some(error.to_string());
+            }
+            Err(error) => {
+                eprintln!("nixaudiod: graph worker: {error}");
+                controller.inner.write().unwrap().stale = Some(error.to_string());
+            }
         }
     }
     Ok(())

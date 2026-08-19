@@ -10,6 +10,13 @@
 # means a test injects a graph change by appending a line to it -- no polling, no sleeps.
 set -eu
 
+# A staged failure of the graph read itself. The daemon cannot see a PipeWire that has gone away
+# any other way, and that is the one fault it can always detect about itself.
+if [ -e "${NIXAUDIO_FAKE_GRAPH}.broken" ]; then
+    echo "pw-dump: cannot connect to PipeWire" >&2
+    exit 1
+fi
+
 if [ "${1:-}" = "--monitor" ]; then
     # Real pw-dump --monitor dumps the current graph before it starts following, so the daemon
     # gets one event as soon as it subscribes. Reproducing that matters: without it the daemon

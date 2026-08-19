@@ -51,6 +51,17 @@ pub struct World {
 }
 
 impl World {
+    /// Stage a graph, declare a device catalogue, and start a daemon with the fabric off. The
+    /// catalogue is what a host says it expects to have names for; a test needs one to say anything
+    /// about a device that is declared and not present.
+    pub fn local_with_catalogue(graph: Value, catalogue: Value) -> Self {
+        Self::new(graph, |config| {
+            config["peers"] = json!({});
+            config["catalogue"] = catalogue;
+        })
+        .started(true)
+    }
+
     /// Stage a graph and start a daemon against it, with the fabric switched off. Most tests are
     /// about the local graph and want no peer traffic at all.
     pub fn local(graph: Value) -> Self {
@@ -64,6 +75,24 @@ impl World {
     pub fn with_peers(graph: Value, peers: Value) -> Self {
         Self::new(graph, |config| {
             config["peers"] = peers;
+        })
+        .started(false)
+    }
+
+    /// Stage a graph and start a daemon with the fabric live, talking to `peers`, but launching
+    /// something other than the healthy JackTrip stand-in. The command is the one interception
+    /// point that needs no production change, so a test can supply a worker that fails in a
+    /// specific way -- exits at once, refuses to bind -- and watch how the supervisor answers.
+    pub fn with_peers_running(graph: Value, peers: Value, jacktrip_fixture: &str) -> Self {
+        let command = fixtures_directory().join(jacktrip_fixture);
+        assert!(
+            command.is_file(),
+            "no such jacktrip fixture: {}",
+            command.display()
+        );
+        Self::new(graph, |config| {
+            config["peers"] = peers;
+            config["transport"]["command"] = json!([command.to_str().unwrap()]);
         })
         .started(false)
     }
@@ -161,6 +190,18 @@ impl World {
     }
 
     /// Replace the graph the fake `pw-dump` reports, then wake the daemon.
+    /// Make the graph read fail, as a PipeWire that has stopped answering.
+    pub fn break_graph_source(&self) {
+        std::fs::write(self.graph_path.with_extension("json.broken"), b"").unwrap();
+        self.notify();
+    }
+
+    /// Let it answer again.
+    pub fn mend_graph_source(&self) {
+        let _ = std::fs::remove_file(self.graph_path.with_extension("json.broken"));
+        self.notify();
+    }
+
     pub fn stage(&self, graph: Value) {
         std::fs::write(&self.graph_path, serde_json::to_vec(&graph).unwrap()).unwrap();
         self.notify();

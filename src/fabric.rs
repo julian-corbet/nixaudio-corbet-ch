@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     process::Stdio,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -82,10 +82,23 @@ const MISSES_BEFORE_UNREACHABLE: u32 = 3;
 
 /// Passes to skip after a worker fails to start, doubling to this ceiling.
 ///
-/// A command that cannot execute fails identically every 2 s forever, which is how a broken
+/// A worker that will not stay up fails identically every 2 s forever, which is how a broken
 /// `transport.command` once produced 86 000 journal lines a day on a live desktop. Backing off
-/// costs nothing a peer notices: it only delays retrying something that has never worked.
+/// costs nothing a peer notices: it only delays retrying something that has just proven it does not
+/// work.
+///
+/// This covers BOTH ways a worker fails to run, and covering only the first is a bug this had:
+/// a command that cannot be executed at all, and a command that execs perfectly and then exits --
+/// which is what JackTrip does when its port is already bound, or when it cannot reach a JACK
+/// graph. The second case never reaches `spawn_worker`'s error path, so it respawned unthrottled.
 const MAX_SPAWN_BACKOFF: u32 = 64;
+
+/// How long a worker must survive before its start counts as having worked.
+///
+/// Longer than JackTrip's own ten-second `--timeout`, so a session that merely never received
+/// anything is not mistaken for one that failed to start. A worker that lasts this long has proven
+/// the command is sound, so its failure history is forgiven and a later restart is immediate.
+const HEALTHY_RUN: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct PeerSnapshot {
@@ -112,6 +125,20 @@ struct WorkerSpec {
 struct Worker {
     spec: WorkerSpec,
     child: Child,
+    /// When this process was started, so a reaped worker can be asked whether it ran or merely
+    /// launched. Without it, "it started" and "it stayed up" are the same observation.
+    started: Instant,
+}
+
+/// A pause before retrying a worker that would not stay up.
+///
+/// `remaining` and `length` are separate on purpose: the pause has to keep growing across
+/// consecutive failures, and collapsing them into one counter resets the growth every time it
+/// reaches zero -- which yields a fixed one-pass pause forever rather than a backoff.
+#[derive(Default)]
+struct Backoff {
+    remaining: u32,
+    length: u32,
 }
 
 #[derive(Default)]
@@ -125,8 +152,8 @@ pub struct Runtime {
     /// Failed probes for peers that have never once answered, which have no `PeerSnapshot` to
     /// count in. Exists so the first failure is reported and the next ten thousand are not.
     unseen: BTreeMap<String, u32>,
-    /// Remaining passes to skip before retrying a worker that would not start.
-    spawn_backoff: BTreeMap<String, u32>,
+    /// Pauses before retrying workers that would not stay up.
+    spawn_backoff: BTreeMap<String, Backoff>,
 }
 
 fn safe(value: &str) -> String {
@@ -423,6 +450,14 @@ impl Runtime {
             if worker.child.try_wait()?.is_some() {
                 if let Some(mut worker) = self.workers.remove(name) {
                     let _ = worker.child.wait().await;
+                    // A worker that exits almost immediately did not run, it only launched. That is
+                    // a failed start whatever the exit code says, and it has to be throttled like
+                    // one -- JackTrip exits this way when its port is already bound or when it
+                    // cannot reach a JACK graph, and neither is fixed by trying again in two
+                    // seconds, forever.
+                    if worker.started.elapsed() < HEALTHY_RUN {
+                        self.penalise(name);
+                    }
                 }
             }
         }
@@ -442,7 +477,15 @@ impl Runtime {
         match self.workers.get(name) {
             // Already running exactly this. Nothing to do -- and in particular no restart, which
             // would be an audible gap bought for nothing.
-            Some(worker) if worker.spec == spec => return Ok(()),
+            Some(worker) if worker.spec == spec => {
+                // It has been up long enough to have proven itself, so forget any past trouble.
+                // Otherwise a session that recovered hours ago would still be serving a penalty the
+                // next time its spec legitimately changed.
+                if worker.started.elapsed() >= HEALTHY_RUN {
+                    self.spawn_backoff.remove(name);
+                }
+                return Ok(());
+            }
             Some(_) => {
                 if let Some(mut worker) = self.workers.remove(name) {
                     let _ = worker.child.kill().await;
@@ -452,28 +495,46 @@ impl Runtime {
             None => {}
         }
 
-        if let Some(remaining) = self.spawn_backoff.get_mut(name) {
-            if *remaining > 0 {
-                *remaining -= 1;
+        if let Some(backoff) = self.spawn_backoff.get_mut(name) {
+            if backoff.remaining > 0 {
+                backoff.remaining -= 1;
                 return Ok(());
             }
         }
         match spawn_worker(&spec) {
             Ok(child) => {
-                self.spawn_backoff.remove(name);
-                self.workers.insert(name.to_owned(), Worker { spec, child });
+                // Deliberately NOT clearing the backoff here. Starting is not staying up, and this
+                // is the exact distinction the bug turned on: clearing on spawn meant a process
+                // that exited a moment later began each cycle with a clean record.
+                self.workers.insert(
+                    name.to_owned(),
+                    Worker {
+                        spec,
+                        child,
+                        started: Instant::now(),
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
-                let backoff = self.spawn_backoff.entry(name.to_owned()).or_insert(0);
-                let first = *backoff == 0;
-                *backoff = (*backoff * 2 + 1).min(MAX_SPAWN_BACKOFF);
+                let first = self
+                    .spawn_backoff
+                    .get(name)
+                    .is_none_or(|backoff| backoff.length == 0);
+                self.penalise(name);
                 if first {
                     return Err(error);
                 }
                 Ok(())
             }
         }
+    }
+
+    /// Lengthen this peer's pause before another attempt, and start serving it.
+    fn penalise(&mut self, name: &str) {
+        let backoff = self.spawn_backoff.entry(name.to_owned()).or_default();
+        backoff.length = (backoff.length * 2 + 1).min(MAX_SPAWN_BACKOFF);
+        backoff.remaining = backoff.length;
     }
 }
 
@@ -716,6 +777,7 @@ mod tests {
                     .stderr(Stdio::null())
                     .spawn()
                     .unwrap(),
+                started: Instant::now(),
             },
         );
 
@@ -783,6 +845,7 @@ mod tests {
                     .stderr(Stdio::null())
                     .spawn()
                     .unwrap(),
+                started: Instant::now(),
             },
         );
 

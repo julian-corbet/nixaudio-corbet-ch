@@ -548,17 +548,16 @@ impl Graph {
             })
             .collect();
         unavailable_devices.sort_by(|a, b| a.id.cmp(&b.id));
-        let missing = config
-            .catalogue
-            .iter()
-            .filter(|(_, entry)| entry.origin == "local")
-            .filter(|(key, _)| {
-                !outputs
-                    .iter()
-                    .chain(inputs.iter())
-                    .any(|endpoint| endpoint.location == "local" && &endpoint.device == *key)
-            })
-            .count();
+        // A DECLARED LOCAL DEVICE THAT IS NOT PLUGGED IN HERE IS NOT A FAULT, and counting it as one
+        // is why this signal was useless. A device declaration is a naming rule: it says "if this
+        // hardware appears, call it `hyperx`". The same declaration is deliberately made on every
+        // host the hardware can roam to, because the name has to follow the device. So a headset
+        // sitting in one machine's USB port left the other two permanently degraded, over hardware
+        // they could play into perfectly well through their peers -- a status that is always red
+        // says exactly as little as one that is always green.
+        //
+        // The absence is still published, in `unavailable_devices`, where a UI can show it as what
+        // it is: something declared that is not here. Health does not have to claim it is wrong.
         let unavailable_peers = peers.iter().filter(|peer| !peer.available).count();
         let health =
             if outputs.iter().all(|endpoint| endpoint.location != "local") && inputs.is_empty() {
@@ -566,13 +565,10 @@ impl Graph {
                     status: "error".into(),
                     message: "PipeWire has no local audio devices".into(),
                 }
-            } else if missing > 0 || unavailable_peers > 0 {
+            } else if unavailable_peers > 0 {
                 Health {
                     status: "degraded".into(),
-                    message: format!(
-                        "{} declared local device(s) and {} peer(s) unavailable",
-                        missing, unavailable_peers
-                    ),
+                    message: format!("{unavailable_peers} peer(s) cannot carry audio"),
                 }
             } else {
                 Health {
