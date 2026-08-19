@@ -38,6 +38,26 @@ pub struct Endpoint {
     pub id: String,
     pub device: String,
     pub location: String,
+    /// Whether this endpoint may be ADVERTISED to peers as an output of this machine.
+    ///
+    /// False for a node that is itself a network transport -- a tunnel to another sound server, a
+    /// RAOP speaker. Such a node is perfectly usable from here, and stays selectable locally, but
+    /// telling a peer "this host has an output called X" when X is a pipe back out is untrue, and
+    /// it is the whole of how a circle forms: the peer sends audio for X, our JackTrip delivers it,
+    /// and the pipe forwards it straight back. Measured at 9.35 Mbit/s when the retired Pulse mesh
+    /// was still loaded, on the wire the real audio shares.
+    ///
+    /// Withholding it from the manifest makes the circle unconstructible rather than merely absent:
+    /// a peer cannot route to what it was never told about. Excluding the node ENTIRELY would also
+    /// work and would cost more than it saves -- somebody's AirPlay receiver is a legitimate place
+    /// to send sound, and it cannot loop, because a speaker does not send anything back.
+    ///
+    /// `device.id` is the guard. Anything backed by real hardware is a device whatever else it is
+    /// flagged: a sound card, a USB headset, a BLUETOOTH headset. Bluetooth is a local device
+    /// reached over a radio, not a network transport, and PipeWire does not mark it as one -- the
+    /// guard means it stays exportable even if some future version did.
+    #[serde(default = "exportable_by_default")]
+    pub exportable: bool,
     pub label: String,
     pub available: bool,
     pub volume: f64,
@@ -124,6 +144,10 @@ pub struct Graph {
     actual_default_input: Option<String>,
     fabric: FabricSnapshot,
     node_names: HashMap<String, u32>,
+}
+
+fn exportable_by_default() -> bool {
+    true
 }
 
 fn text(props: &Value, key: &str) -> String {
@@ -365,23 +389,6 @@ impl Graph {
         for node in nodes
             .values()
             .filter(|node| matches!(node.media_class.as_str(), "Audio/Sink" | "Audio/Source"))
-            // A NODE THAT IS ITSELF A NETWORK TRANSPORT IS NOT AN ENDPOINT ON THIS MACHINE.
-            //
-            // It is a pipe to somewhere else, and treating it as a local device makes nixaudio tell
-            // its peers something untrue: "this host has an output called X". A peer believes that,
-            // sends audio for X, our JackTrip delivers it, and the pipe forwards it straight back
-            // out. That is a circle, and it costs real bandwidth on the same wire the audio needs --
-            // 9.35 Mbit/s of it, measured, when the retired Pulse mesh was still loaded here.
-            //
-            // Excluding the node makes the circle unconstructible rather than merely absent: it can
-            // be neither advertised to a peer nor chosen locally, so no combination of routes can
-            // build one.
-            //
-            // `device.id` is the guard. Anything backed by real hardware is a device, whatever else
-            // it is flagged: a sound card, a USB headset, a BLUETOOTH headset. Bluetooth is a local
-            // device reached over a radio, not a network transport, and PipeWire does not mark it
-            // as one -- but the guard means it survives here even if some future version did.
-            .filter(|node| !node.network || node.device_backed)
         {
             let (mut id, device, label) = endpoint_identity(node);
             if endpoint_nodes.contains_key(&id) {
@@ -402,6 +409,7 @@ impl Graph {
                 id: id.clone(),
                 device,
                 location: "local".into(),
+                exportable: !node.network || node.device_backed,
                 label,
                 available: true,
                 volume: node.volume,
@@ -466,6 +474,8 @@ impl Graph {
                         .into(),
                     location: peer.clone(),
                     label: format!("{} · {}", peer, manifest.label),
+                    // Never re-advertised: this is another host's endpoint, reached through it.
+                    exportable: false,
                     // BOTH halves, and the conjunction is the point. The port count is a
                     // media-plane fact about OUR process; `remote.available` is a control-plane
                     // fact about THEIRS. Ports outlive the peer -- they vanish only when JackTrip
@@ -717,7 +727,7 @@ impl Graph {
         ] {
             for endpoint in endpoints
                 .iter()
-                .filter(|endpoint| endpoint.location == "local")
+                .filter(|endpoint| endpoint.location == "local" && endpoint.exportable)
             {
                 let mut endpoint_ports: Vec<&Port> = self
                     .endpoint_ports

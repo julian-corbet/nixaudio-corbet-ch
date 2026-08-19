@@ -580,7 +580,7 @@ fn a_daemon_that_cannot_read_the_graph_at_startup_starts_anyway_and_recovers() {
     );
 }
 
-/// A circle must be unconstructible, not merely absent.
+/// A circle must be unconstructible, not merely absent — and the cure must not cost a speaker.
 ///
 /// PipeWire marks a node that pipes audio off the machine with `node.network`. Treating one as a
 /// local device made nixaudio tell its peers "this host has an output called X" — untrue, X is a
@@ -590,7 +590,7 @@ fn a_daemon_that_cannot_read_the_graph_at_startup_starts_anyway_and_recovers() {
 /// Excluding such a node means no combination of routes can build the loop: it is neither
 /// advertised to a peer nor selectable here.
 #[test]
-fn a_network_pipe_is_not_an_output_on_this_machine() {
+fn a_network_pipe_is_usable_here_but_never_advertised_to_a_peer() {
     let mut graph = one_sink_and_firefox("A useful tab");
     graph.as_array_mut().unwrap().extend([
         // A tunnel to another host, exactly as the retired Pulse mesh left them.
@@ -608,7 +608,7 @@ fn a_network_pipe_is_not_an_output_on_this_machine() {
         }}}),
         port(71, 70, "playback_FL", "in", "FL"),
     ]);
-    let world = World::local(graph);
+    let world = World::local_but_reachable(graph);
     let snapshot = world.inspect();
     let ids: Vec<&str> = snapshot["outputs"]
         .as_array()
@@ -617,18 +617,49 @@ fn a_network_pipe_is_not_an_output_on_this_machine() {
         .map(|output| output["id"].as_str().unwrap())
         .collect();
 
+    // The pipe stays USABLE here. Somebody's AirPlay receiver is the same shape and is a
+    // legitimate place to send sound; it cannot loop, because a speaker sends nothing back.
+    let pipe = snapshot["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|output| output["id"].as_str().unwrap().contains("fabric_6_deadbeef"))
+        .expect("a network sink is still selectable on the machine it is attached to");
+    // ...but it is never ADVERTISED, and that is what makes the circle unconstructible: a peer
+    // cannot route to what it was never told about.
+    assert_eq!(
+        pipe["exportable"],
+        json!(false),
+        "a pipe out of this machine must not be offered to a peer as an output OF this machine"
+    );
+    let bluetooth = snapshot["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|output| output["id"].as_str().unwrap().contains("bluez_output"))
+        .expect("a Bluetooth headset is a local device and must survive the rule");
+    assert_eq!(
+        bluetooth["exportable"],
+        json!(true),
+        "Bluetooth is hardware reached over a radio, not a network transport: a peer may use it"
+    );
+    let _ = ids;
+
+    // The decisive assertion: what a PEER actually receives. The flag above is only the mechanism;
+    // this is the behaviour, and it is what fails if the manifest ever stops honouring it.
+    let manifest = world.published_manifest();
+    let advertised: Vec<&str> = manifest["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|output| output["id"].as_str().unwrap())
+        .collect();
     assert!(
-        !ids.iter().any(|id| id.contains("fabric_6_deadbeef")),
-        "a pipe to another host is not an output here: {ids:?}"
+        !advertised.iter().any(|id| id.contains("deadbeef")),
+        "a peer must never be told this host has an output that is a pipe back out: {advertised:?}"
     );
     assert!(
-        ids.iter().any(|id| id.contains("bluez_output")),
-        "a Bluetooth headset is a local device and must survive the rule: {ids:?}"
-    );
-    // And the manifest is what a peer believes, so the pipe must be absent from that too —
-    // otherwise the circle is merely hidden from this host's own menu.
-    assert!(
-        !serde_json::to_string(&snapshot).unwrap().contains("deadbeef"),
-        "the pipe must not reach a peer by any path"
+        advertised.iter().any(|id| id.contains("bluez_output")),
+        "and it must still be told about the Bluetooth headset: {advertised:?}"
     );
 }

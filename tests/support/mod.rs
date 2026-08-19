@@ -39,6 +39,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 const CALL_PATIENCE: Duration = Duration::from_secs(5);
 
 pub struct World {
+    control_port: u16,
     directory: tempfile::TempDir,
     bus: Child,
     bus_address: String,
@@ -60,6 +61,16 @@ impl World {
             config["catalogue"] = catalogue;
         })
         .started(true)
+    }
+
+    /// Stage a graph and start a daemon with NO peers but the control server LISTENING, so a test
+    /// can fetch the manifest this host publishes exactly as a peer would. Peerless on purpose:
+    /// what a host advertises is a property of the host, not of who is asking.
+    pub fn local_but_reachable(graph: Value) -> Self {
+        Self::new(graph, |config| {
+            config["peers"] = json!({});
+        })
+        .started(false)
     }
 
     /// Stage a graph and start a daemon against it, with the fabric switched off. Most tests are
@@ -122,9 +133,10 @@ impl World {
         std::fs::write(&events_path, b"").unwrap();
         std::fs::write(&log_path, b"").unwrap();
 
+        let control_port = free_port();
         let mut config = json!({
             "node": "alpha",
-            "control": { "listen": "127.0.0.1", "port": free_port() },
+            "control": { "listen": "127.0.0.1", "port": control_port },
             "transport": { "command": [fixtures.join("jacktrip").to_str().unwrap()] },
             "peers": {},
             "catalogue": {},
@@ -135,6 +147,7 @@ impl World {
         let (bus, bus_address) = start_bus(&root);
 
         Self {
+            control_port,
             directory,
             bus,
             bus_address,
@@ -210,6 +223,30 @@ impl World {
     pub fn mend_graph_source(&self) {
         let _ = std::fs::remove_file(self.graph_path.with_extension("json.broken"));
         self.notify();
+    }
+
+    /// The manifest a PEER receives, fetched the way a peer fetches it: over the control port,
+    /// with the real greeting. Asserting on this rather than on the local snapshot is the
+    /// difference between checking a flag and checking the behaviour the flag is supposed to cause.
+    pub fn published_manifest(&self) -> Value {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match std::net::TcpStream::connect(("127.0.0.1", self.control_port)) {
+                Ok(mut stream) => {
+                    stream.write_all(b"NXAUDIO/1 MANIFEST\n").unwrap();
+                    stream.shutdown(std::net::Shutdown::Write).ok();
+                    let mut body = String::new();
+                    stream.read_to_string(&mut body).unwrap();
+                    return serde_json::from_str(&body).expect("a peer receives JSON");
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("the control port never answered: {error}"),
+            }
+        }
     }
 
     pub fn stage(&self, graph: Value) {
