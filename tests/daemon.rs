@@ -869,3 +869,84 @@ fn a_remote_endpoint_refuses_a_level_change_rather_than_pretending() {
         .ctl(&["mute", "local.hyperx.analog-stereo", "on"])
         .expect("a local mute still sets");
 }
+
+/// A stream nobody asked us about belongs to PipeWire, and stays where PipeWire put it.
+///
+/// BEHAVIORS: "PipeWire owns each host's local graph. Devices, streams, ports, mixing and local
+/// policy are its job. nixaudio never becomes a second media graph." A local default is applied
+/// with `wpctl set-default`, so PipeWire already places new streams there; re-asserting it every
+/// pass added nothing and took away the ability to move a stream at all. Measured on corbet-server
+/// before this: a stream moved by hand onto another sink was dragged back within five seconds,
+/// repeatedly, which made nixaudio fight pavucontrol, wpctl and the desktop's own settings.
+#[test]
+fn a_stream_we_were_never_asked_about_is_left_where_someone_else_put_it() {
+    // Two local sinks. The stream is already linked to the SECOND one, as though a person had just
+    // moved it there, while the default output is the first.
+    let mut graph = json!([
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+        port(12, 10, "playback_FR", "in", "FR"),
+        sink(30, 300, "alsa_output.usb-shure", "shure", "analog-stereo"),
+        port(31, 30, "playback_FL", "in", "FL"),
+        port(32, 30, "playback_FR", "in", "FR"),
+        stream(20, 200, "Firefox", "A useful tab", "Music"),
+        port(21, 20, "output_FL", "out", "FL"),
+        port(22, 20, "output_FR", "out", "FR"),
+    ]);
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend([link(40, 20, 21, 30, 31), link(41, 20, 22, 30, 32)]);
+
+    let world = World::local(graph);
+    world
+        .ctl(&["default-output", "local.hyperx.analog-stereo"])
+        .expect("set the default to the OTHER sink");
+
+    // Long enough for many reconcile passes to have run.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let calls = world.calls();
+    let relinked: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("pw-link ") && !c.starts_with("pw-link -d"))
+        .collect();
+    assert!(
+        relinked.is_empty(),
+        "an unpinned stream must not be dragged onto the default; nixaudio issued {relinked:?}"
+    );
+}
+
+/// ...but a REMOTE default is the one case where this loop is not redundant, it is the whole
+/// implementation. There is deliberately no fake local sink for `wpctl` to select, so a peer's
+/// speakers can only be reached by linking each unpinned stream to its JackTrip slice. Without
+/// this half, the fix above would silently delete the feature.
+#[test]
+fn an_unpinned_stream_still_follows_a_remote_default_because_pipewire_cannot() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+    world.until("beta to be usable", |s| {
+        s["outputs"].as_array().is_some_and(|o| {
+            o.iter()
+                .any(|e| e["id"] == "beta.hyperx" && e["available"] == true)
+        })
+    });
+
+    world
+        .ctl(&["default-output", "beta.hyperx"])
+        .expect("make the peer's speakers the default");
+
+    world.until_calls("the unpinned stream to be linked across the fabric", |calls| {
+        calls.iter().any(|c| c == "pw-link 21 51")
+    });
+}

@@ -340,7 +340,26 @@ fn refresh(
     // already destroyed the links, and the stream fell silent with its route still "set".
     for stream in &graph.snapshot.streams {
         let wanted: Vec<String> = if stream.explicit_targets.is_empty() {
-            graph.snapshot.default_output.clone().into_iter().collect()
+            // NOBODY ASKED US ABOUT THIS STREAM, so in general it is not ours to place.
+            //
+            // BEHAVIORS: "PipeWire owns each host's local graph. Devices, streams, ports, mixing
+            // and local policy are its job. nixaudio never becomes a second media graph." A local
+            // default is set through `wpctl set-default`, so PipeWire already puts new streams
+            // there without help from us -- and re-asserting it every pass did not add anything,
+            // it TOOK something away: moving a stream in pavucontrol, wpctl or the desktop's own
+            // settings was undone within a couple of seconds, every time, with no way to keep it.
+            // Measured on corbet-server before this: a stream moved by hand was back on the
+            // previous sink five seconds later.
+            //
+            // The exception is a REMOTE default, where this loop is not redundant but is the whole
+            // implementation: there is deliberately no fake local sink for wpctl to select, so a
+            // peer's speakers can only be reached by linking each unpinned stream to its JackTrip
+            // slice. See `Graph::set_default`, which returns Ok without doing anything for exactly
+            // that reason.
+            match graph.snapshot.default_output.as_deref() {
+                Some(default) if !graph.is_locally_owned(default) => vec![default.to_owned()],
+                _ => continue,
+            }
         } else {
             stream.explicit_targets.clone()
         };

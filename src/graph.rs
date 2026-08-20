@@ -953,6 +953,14 @@ impl Graph {
         Ok(())
     }
 
+    /// Whether this endpoint is a real node on THIS machine, which PipeWire can select by itself.
+    ///
+    /// `endpoint_nodes` holds local nodes only -- the remote branch of `from_values` never writes
+    /// it -- so this is the same discriminator `set_default` already turns on, named.
+    pub fn is_locally_owned(&self, endpoint: &str) -> bool {
+        self.endpoint_nodes.contains_key(endpoint)
+    }
+
     pub fn set_default(&self, endpoint: &str) -> Result<()> {
         let Some(node) = self.endpoint_nodes.get(endpoint) else {
             // A remote default is implemented by routing every unpinned stream to its JackTrip
