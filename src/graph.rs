@@ -400,10 +400,17 @@ impl Graph {
         let mut endpoint_nodes = HashMap::new();
         let mut endpoint_ports = HashMap::new();
         let mut node_endpoints = HashMap::new();
-        for node in nodes
+        // BY SERIAL, because `nodes` is a HashMap and the loop below hands the bare id to whichever
+        // node it sees FIRST and a `.{serial}` suffix to the next one. In HashMap order that is a
+        // coin flip: two devices matched by one naming rule swap ids between restarts, and a route
+        // persisted to `local.hyperx.analog-stereo` then plays out of the other headset. The serial
+        // is PipeWire's own creation order, so the older device keeps the plain name.
+        let mut endpoint_candidates: Vec<&Node> = nodes
             .values()
             .filter(|node| matches!(node.media_class.as_str(), "Audio/Sink" | "Audio/Source"))
-        {
+            .collect();
+        endpoint_candidates.sort_by_key(|node| node.serial);
+        for node in endpoint_candidates {
             let (mut id, device, label) = endpoint_identity(node);
             if endpoint_nodes.contains_key(&id) {
                 id = format!("{}.{}", id, node.serial);
@@ -566,10 +573,17 @@ impl Graph {
             stream_nodes.insert(id.clone(), node.id);
             stream_intents.insert(id, intent_key);
         }
+        // The id is the TIEBREAK, and it is load-bearing rather than tidy. Two streams from one
+        // application with no distinct `media.name` -- two browser tabs playing nothing named --
+        // compare equal on both other keys, so their order fell out of a HashMap traversal and
+        // flipped between passes. `refresh` now publishes a revision only when the snapshot
+        // actually differs, so an unstable order is indistinguishable from a real change: it would
+        // wake every client at roughly half the reconcile rate, for ever, with nothing to show.
         streams.sort_by(|a, b| {
             a.application
                 .cmp(&b.application)
                 .then(a.title.cmp(&b.title))
+                .then(a.id.cmp(&b.id))
         });
 
         let mut peers: Vec<Peer> = config

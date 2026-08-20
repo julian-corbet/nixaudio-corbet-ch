@@ -950,3 +950,72 @@ fn an_unpinned_stream_still_follows_a_remote_default_because_pipewire_cannot() {
         calls.iter().any(|c| c == "pw-link 21 51")
     });
 }
+
+/// Two streams that look identical must not make the snapshot reorder itself.
+///
+/// `refresh` publishes a revision only when the snapshot actually differs, so an unstable sort is
+/// indistinguishable from a real change: two browser tabs with no `media.name` compare equal on
+/// application and title, their order fell out of a HashMap traversal, and the daemon would wake
+/// every client at roughly half the reconcile rate for ever with nothing to show. That is the same
+/// pathology as the pw-dump self-wake, arriving by a different door.
+#[test]
+fn two_indistinguishable_streams_do_not_make_the_snapshot_flap() {
+    let world = World::local(json!([
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+        port(12, 10, "playback_FR", "in", "FR"),
+        // Same application, same (absent) title. Only the ids differ.
+        stream(20, 200, "Firefox", "", "Music"),
+        port(21, 20, "output_FL", "out", "FL"),
+        stream(40, 400, "Firefox", "", "Music"),
+        port(41, 40, "output_FL", "out", "FL"),
+    ]));
+
+    world.until("both streams to be read", |s| {
+        s["streams"].as_array().is_some_and(|v| v.len() == 2)
+    });
+
+    let before = world.inspect()["revision"].as_u64().expect("a revision");
+    for _ in 0..8 {
+        world.notify();
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    let after = world.inspect()["revision"].as_u64().expect("a revision");
+
+    assert_eq!(
+        before, after,
+        "eight passes over two identical-looking streams must produce no news"
+    );
+}
+
+/// When one naming rule matches two devices, which one keeps the plain id must not be a coin flip.
+///
+/// The loop hands the bare id to whichever node it meets first and a `.{serial}` suffix to the
+/// next. Iterating a HashMap made that a per-restart lottery, so a route persisted against
+/// `local.hyperx.analog-stereo` could come back bound to the other headset. Ordering by PipeWire's
+/// own creation order makes the older device keep the plain name, every time.
+#[test]
+fn the_older_of_two_matching_devices_keeps_the_plain_name() {
+    // Same vendor/product identity, so `endpoint_identity` yields the same base id for both.
+    let world = World::local(json!([
+        sink(30, 900, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(31, 30, "playback_FL", "in", "FL"),
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+    ]));
+
+    let snapshot = world.until("both sinks to be read", |s| {
+        s["outputs"].as_array().is_some_and(|v| v.len() == 2)
+    });
+    let outputs = snapshot["outputs"].as_array().expect("outputs");
+
+    let plain = outputs
+        .iter()
+        .find(|e| e["id"] == "local.hyperx.analog-stereo")
+        .expect("one endpoint keeps the plain id");
+    assert_eq!(
+        plain["pipewire_id"], 10,
+        "the plain id must belong to the LOWER serial (900 vs 100), not to whichever the map \
+         happened to yield first"
+    );
+}
