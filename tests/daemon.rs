@@ -768,3 +768,55 @@ fn a_client_appearing_is_not_a_graph_change_but_a_node_is() {
         s["health"]["status"] == "error"
     });
 }
+
+/// A level we do not have is reported as absent, never as a number.
+///
+/// `fabric::EndpointManifest` carries id, label and channels — and nothing about level or mute. So
+/// a peer's speakers have no reading here, and the daemon refuses to set one. It used to publish
+/// `1.0`/unmuted for every remote endpoint, which a tray tooltip rendered as "100%": a confident
+/// statement about a device that might have been muted. Absence beats a guess.
+#[test]
+fn a_remote_endpoint_publishes_no_level_rather_than_a_convincing_one() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+
+    let snapshot = world.until("beta's endpoint to appear", |s| {
+        s["outputs"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|e| e["id"] == "beta.hyperx"))
+    });
+
+    let outputs = snapshot["outputs"].as_array().expect("outputs");
+    let remote = outputs
+        .iter()
+        .find(|e| e["id"] == "beta.hyperx")
+        .expect("beta.hyperx");
+    assert!(
+        remote["volume"].is_null() && remote["muted"].is_null(),
+        "a remote endpoint must publish no level at all, got volume={} muted={}",
+        remote["volume"],
+        remote["muted"]
+    );
+
+    // And the local one still does, so this is not "the field stopped working".
+    let local = outputs
+        .iter()
+        .find(|e| e["id"] == "local.hyperx.analog-stereo")
+        .expect("the local sink");
+    assert!(
+        local["volume"].is_number() && local["muted"].is_boolean(),
+        "a local endpoint still reports a real level, got volume={} muted={}",
+        local["volume"],
+        local["muted"]
+    );
+}

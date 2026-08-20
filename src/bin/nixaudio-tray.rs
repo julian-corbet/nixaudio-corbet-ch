@@ -239,14 +239,16 @@ impl Tray for AudioTray {
         let Some(output) = self.default_output() else {
             return "audio-volume-muted".into();
         };
-        if output.location != "local" {
+        // An icon that shows a level is a claim to know one. A remote endpoint publishes none, so
+        // it gets the plain speaker rather than a bar height picked out of the air.
+        let (Some(volume), Some(muted)) = (output.volume, output.muted) else {
             return "audio-speakers".into();
-        }
-        if output.muted || output.volume == 0.0 {
+        };
+        if muted || volume == 0.0 {
             "audio-volume-muted"
-        } else if output.volume < 0.34 {
+        } else if volume < 0.34 {
             "audio-volume-low"
-        } else if output.volume < 0.67 {
+        } else if volume < 0.67 {
             "audio-volume-medium"
         } else {
             "audio-volume-high"
@@ -257,7 +259,7 @@ impl Tray for AudioTray {
         if self
             .snapshot
             .as_ref()
-            .is_some_and(|v| v.inputs.iter().any(|input| input.muted))
+            .is_some_and(|v| v.inputs.iter().any(|input| input.muted == Some(true)))
         {
             "microphone-sensitivity-muted".into()
         } else {
@@ -268,7 +270,12 @@ impl Tray for AudioTray {
         if let Some(snapshot) = &self.snapshot {
             let output = self
                 .default_output()
-                .map(|v| format!("{} ({}%)", v.id, (v.volume * 100.0).round()))
+                .map(|v| match v.volume {
+                    Some(level) => format!("{} ({}%)", v.id, (level * 100.0).round()),
+                    // The one place this actually leaked: a peer's speakers were shown at "100%",
+                    // which is not a reading, it is the absence of one.
+                    None => format!("{} (level not published)", v.id),
+                })
                 .unwrap_or_else(|| "no default output".into());
             ToolTip {
                 icon_name: self.icon_name(),
@@ -293,7 +300,10 @@ impl Tray for AudioTray {
             .default_output()
             .filter(|output| output.location == "local")
         {
-            let value = (output.volume + if delta > 0 { 0.05 } else { -0.05 }).clamp(0.0, 1.5);
+            let Some(current) = output.volume else {
+                return;
+            };
+            let value = (current + if delta > 0 { 0.05 } else { -0.05 }).clamp(0.0, 1.5);
             let _ = self.actions.send(Action::Volume {
                 object: output.id.clone(),
                 value,
@@ -327,14 +337,16 @@ impl Tray for AudioTray {
             .default_output()
             .filter(|output| output.location == "local")
         {
-            menu.push(
-                SubMenu {
-                    label: format!("Output volume · {}%", (output.volume * 100.0).round()),
-                    submenu: Self::volume_actions(&output.id, output.volume, output.muted),
-                    ..Default::default()
-                }
-                .into(),
-            );
+            if let (Some(volume), Some(muted)) = (output.volume, output.muted) {
+                menu.push(
+                    SubMenu {
+                        label: format!("Output volume · {}%", (volume * 100.0).round()),
+                        submenu: Self::volume_actions(&output.id, volume, muted),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
         }
         menu.push(MenuItem::Separator);
         if snapshot.streams.is_empty() {

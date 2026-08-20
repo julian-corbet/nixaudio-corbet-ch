@@ -60,8 +60,16 @@ pub struct Endpoint {
     pub exportable: bool,
     pub label: String,
     pub available: bool,
-    pub volume: f64,
-    pub muted: bool,
+    /// The level, WHERE ONE IS KNOWN.
+    ///
+    /// `None` for every remote endpoint, and that is a statement about the wire rather than about
+    /// the speaker: `fabric::EndpointManifest` carries only id, label and channels, so a peer never
+    /// tells us what its own level is. It was previously reported as `1.0`, which is a number we
+    /// invented -- and it read as "this device is at 100%" in a tray tooltip on a device that might
+    /// be muted. Absence beats a guess: a consumer that cannot render "unknown" must say so rather
+    /// than pick a number, and `set_volume` refuses these outright anyway.
+    pub volume: Option<f64>,
+    pub muted: Option<bool>,
     pub pipewire_id: Option<u32>,
     pub pipewire_name: Option<String>,
 }
@@ -418,8 +426,8 @@ impl Graph {
                 exportable: !node.network || node.device_backed,
                 label,
                 available: true,
-                volume: node.volume,
-                muted: node.muted,
+                volume: Some(node.volume),
+                muted: Some(node.muted),
                 pipewire_id: Some(node.id),
                 pipewire_name: Some(node.name.clone()),
             };
@@ -490,8 +498,9 @@ impl Graph {
                     // `available: true` while nothing had ever carried a packet.
                     available: remote.available
                         && target_ports.len() == slice.channels.len(),
-                    volume: 1.0,
-                    muted: false,
+                    // Not "unity" -- unknown. See Endpoint::volume.
+                    volume: None,
+                    muted: None,
                     pipewire_id: jacktrip.map(|node| node.id),
                     pipewire_name: jacktrip.map(|node| node.name.clone()),
                 });
