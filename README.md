@@ -49,10 +49,11 @@ PipeWire performs the actual n-to-n mixing at both ends.
 | Stable local device identity | WirePlumber rules derive semantic names from declared USB or explicit hardware identity |
 | Live graph and hotplug | `pw-dump --monitor`, rebuilt into a versioned snapshot and emitted over D-Bus |
 | Per-stream n-to-n routing | native `pw-link` links; remembered by application/media intent rather than volatile node ID |
+| Streams nobody routed | left alone. A stream with no route of its own belongs to PipeWire's local policy, which already places it on the default; nixaudio does not re-assert that every pass, so moving a stream in `pavucontrol`, `wpctl` or a desktop's own settings STAYS moved. The one exception is a remote default, where there is no local sink for `wpctl` to select and linking each unrouted stream to the peer's channel slice is the entire implementation of it |
 | Local defaults, volume and mute | implemented through `wpctl` |
 | Cross-host output discovery | live peer manifests; no evaluation-time guesses or fake sinks |
 | Cross-host media | pinned upstream JackTrip 3.0.0 through PipeWire's JACK compatibility layer; proven end to end between two hosts |
-| Multiplexing | one asymmetric multichannel connection per peer, with deterministic endpoint slices |
+| Multiplexing | one asymmetric multichannel connection per peer, with deterministic endpoint slices. Slices are allocated for EVERY endpoint a peer advertises, routed or not, so the width is a property of what exists rather than of what is in use: a host advertising seven stereo outputs is sent fourteen channels whether or not anything plays. The cost is continuous — measured at 16 Mbit/s outbound on a host with no routes at all — and it is what the datagram budget below has to be reconciled with |
 | Per-link transport tuning | period, sample resolution, queue depth and packet redundancy are properties of one peer link, not of the host, because a peer on the same switch and a peer on a hotspot need different answers at the same time. `queue` defaults to `auto`, which lets JackTrip's Regulator size the buffer from the link it observes instead of a fixed tolerance |
 | A peer that comes and goes | presence belongs to the PEER, not to a transport process: an endpoint is usable only while its peer answers and a session for it is held. Going away takes three consecutive missed probes, about six seconds, so a control-plane blip is not an outage; coming back takes one answer |
 | Routes that outlive an outage | a route is remembered as intent and the intent is never overwritten. While its destination is away the stream plays on something audible here, and it reclaims the destination unprompted when the peer returns. A remembered default output follows the same rule |
@@ -60,8 +61,8 @@ PipeWire performs the actual n-to-n mixing at both ends.
 | Process supervision | JackTrip workers that died, whose command changed, or whose peer left the configuration are restarted or reaped on every pass; one that refuses to stay up is retried with a growing pause rather than respawned in a loop |
 | Health | a single status that can genuinely go red: `error` while the daemon cannot read the PipeWire graph and is therefore serving a snapshot about the past, or while the host has no local devices at all; `degraded` while a peer cannot carry audio. A declared device that is currently plugged into a different host is reported as absent, not as a fault — the same declaration is deliberately made on every host the hardware can roam to |
 | Frontend | tray defaults, stream volume/mute, route checkboxes and peer state |
-| Remote output level control | not yet; levels remain stream-local in this slice |
-| Remote microphone consumption | manifested but not yet exposed as a local capture target |
+| Remote output level control | not available, and reported as absent rather than guessed. The manifest carries no level or mute, so a peer's endpoint publishes `null` for both instead of a plausible `1.0`, and setting one is refused rather than silently dropped |
+| Remote microphone consumption | UNREACHABLE by construction, not merely unexposed. A host publishes its inputs in the manifest and a peer parses them, but session planning allocates channels from outputs only, so no channel ever carries a remote input in either direction. The field is honest about what exists and misleading about what works; closing that is a protocol change, not a UI one |
 | Internet authentication/encryption | not yet; the first slice is trusted-LAN only |
 
 ## Naming and API
@@ -156,6 +157,70 @@ port", and if it does so before the daemon binds, the host silently drops out of
 The next transport milestone is pairing plus authenticated, encrypted sessions; it must preserve the
 semantic API and can replace the connection adapter without replacing the UI or local PipeWire
 graph.
+
+## Transport decisions, and what would reopen them
+
+These are written down because each one gets re-argued otherwise, and because the reasoning is
+easier to check than to reconstruct.
+
+### Upstream JackTrip carries the media, and nixaudio does not
+
+nixaudio moves no audio. It reads the PipeWire graph, links ports, and supervises one JackTrip
+process per peer pair. The hard part of a media engine is the jitter buffer, and JackTrip's
+`Regulator` is roughly 1600 lines carrying several years of anti-oscillation work, each patch of
+which exists because a simpler version oscillated. Writing that again is the whole job rather than a
+detail of it.
+
+Reopen it if: latency measured on a real roaming path is dominated by something the Regulator does
+and cannot be configured out of. Note one known limitation — its headroom grows to absorb a rough
+patch and has no decrement in the running loop, so a session that survives a bad minute keeps that
+latency for the life of the process.
+
+### Not roc-toolkit, despite it being the better loss mechanism
+
+`roc-toolkit` (MPL-2.0, packaged in nixpkgs and Arch) is RTP plus real forward error correction:
+Reed-Solomon per RFC 6865 and LDPC-Staircase per RFC 6816, both FECFRAME over UDP. That genuinely
+RECOVERS lost packets, where JackTrip's Regulator only CONCEALS loss by inventing plausible audio.
+On a lossy path ROC is the better mechanism and this is not a criticism of it.
+
+It loses on fit, not on quality:
+
+- It is a media engine, so adopting it means REPLACING JackTrip rather than adding to it — trading a
+  tuned jitter buffer for an untuned one to solve a problem this deployment has not yet measured.
+- It does not deliver what is actually missing. Its public API mentions no encryption, no SRTP and
+  no DTLS, and it does no NAT traversal or peer identity. The connection adapter is still required
+  afterwards, so this is additive work rather than alternative work.
+- FEC costs bytes. Repair packets make the datagram budget tighter at exactly the point where the
+  budget is already the binding constraint (see below).
+
+Reopen it if: measurement from outside the LAN shows LOSS, rather than latency or clock drift, is
+the dominant impairment. That measurement does not exist — the two always-on hosts share a kernel
+and a clock, so nothing observed between them says anything about a real Internet path.
+
+Do NOT reopen the variant where nixaudio carries both engines and switches between them by
+condition. Two media engines is two jitter buffers to tune, and a switch mid-session is itself an
+audible discontinuity — a failure mode added in order to avoid one.
+
+### The datagram budget is the binding constraint
+
+A JackTrip datagram is `redundancy x (16 + period x bytes x channels)` — the header is repeated per
+redundant copy, not amortised across them (`UdpDataProtocol.cpp:558` and `:692` in v3.0.0). At the
+default 128 frames and 16 bits that is 4 channels at redundancy 1 before a ~1140 byte QUIC datagram
+is exceeded, and 2 channels at redundancy 2.
+
+This does not bite today because classic JackTrip is plain UDP, which IP-fragments on a LAN. It
+binds the moment media rides a QUIC datagram, which cannot fragment. Any transport proposal has to
+answer this before it answers anything else.
+
+### Opus does not shorten the road
+
+Measured against the library rather than assumed: in custom (low-latency) mode the encoder refuses
+more than 2 channels at every frame size, `OPUS_SET_INBAND_FEC` returns `OPUS_UNIMPLEMENTED`, and on
+the standard path at 2.5 ms and 5 ms frames no in-band FEC is emitted at all. Decoder-side packet
+loss concealment does work.
+
+So Opus offers concealment, which the Regulator already has, and neither the multichannel nor the
+FEC property that would have justified the change.
 
 ## Verification
 
