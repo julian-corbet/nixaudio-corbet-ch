@@ -122,8 +122,6 @@ fn a_pinned_route_is_restored_when_the_graph_changes_underneath_it() {
     );
 }
 
-/// Level control is a local concern by design: nixaudio moves audio, it does not mix. A remote
-/// endpoint must refuse rather than silently do nothing.
 #[test]
 fn setting_a_local_default_reaches_wpctl() {
     let world = World::local(one_sink_and_firefox("A useful tab"));
@@ -819,4 +817,55 @@ fn a_remote_endpoint_publishes_no_level_rather_than_a_convincing_one() {
         local["volume"],
         local["muted"]
     );
+}
+
+/// Level control is a local concern by design: nixaudio moves audio, it does not mix. A remote
+/// endpoint must REFUSE rather than silently do nothing.
+///
+/// That sentence sat above `setting_a_local_default_reaches_wpctl` for a long time, which sets a
+/// default on a LOCAL endpoint and never touches a remote level — a rule written down as spec and
+/// enforced by nothing. It is also worth pinning because the refusal is currently an accident
+/// rather than a decision: `set_volume` resolves through `endpoint_nodes`, and that map is only
+/// ever written in the local branch of `Graph::from_values`, so a remote id simply misses. Should
+/// anyone one day populate it for remote endpoints, the refusal disappears silently and `wpctl`
+/// gets pointed at a node id that means nothing on this machine.
+#[test]
+fn a_remote_endpoint_refuses_a_level_change_rather_than_pretending() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+    world.until("beta's endpoint to appear", |s| {
+        s["outputs"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|e| e["id"] == "beta.hyperx"))
+    });
+
+    let volume = world.ctl(&["volume", "beta.hyperx", "0.5"]);
+    assert!(
+        volume.is_err(),
+        "setting a level on a peer's speakers must fail, got {volume:?}"
+    );
+    let mute = world.ctl(&["mute", "beta.hyperx", "on"]);
+    assert!(
+        mute.is_err(),
+        "muting a peer's speakers must fail, got {mute:?}"
+    );
+
+    // The same two calls against a LOCAL endpoint still work, so this pins a refusal rather than a
+    // broken command.
+    world
+        .ctl(&["volume", "local.hyperx.analog-stereo", "0.5"])
+        .expect("a local level still sets");
+    world
+        .ctl(&["mute", "local.hyperx.analog-stereo", "on"])
+        .expect("a local mute still sets");
 }
