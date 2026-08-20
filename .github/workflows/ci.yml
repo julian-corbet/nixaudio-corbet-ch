@@ -41,8 +41,14 @@ jobs:
       # fail on platform mismatch rather than on anything about this repository. Hence --no-build
       # for the strict pass, and a second unrestricted pass that genuinely compiles the crate and
       # runs its unit and integration tests on the system the runner can actually build for.
+      #
+      # --keep-going on both passes: one failing check must not abort the rest, so a single
+      # broken derivation cannot hide how every other check fared.
       - name: evaluate every declared system
-        run: nix flake check --all-systems --no-build
+        run: nix flake check --all-systems --no-build --keep-going --print-build-logs
 
+      # Runs even when the strict evaluation pass failed, so the build-and-test result is
+      # reported on its own rather than masked by an evaluation error upstream of it.
       - name: build and test
-        run: nix flake check --print-build-logs
+        if: ${{ !cancelled() }}
+        run: nix flake check --keep-going --print-build-logs
