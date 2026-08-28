@@ -64,7 +64,11 @@ in
 
         # nixpkgs' own PipeWire closure, because on NixOS that is also the daemon that is running
         # -- the client and the server come from one package set. See nixaudio.guard.toolPath.
-        path = lib.optionals (cfg.guard.toolPath == [ ]) [ pkgs.pipewire pkgs.jq pkgs.systemd ];
+        # Every bare command used by the probe must be represented here. In particular, gawk is
+        # not pulled in by the standard systemd service PATH: without it the repair-budget filter
+        # fails after truncating its state file, so every WirePlumber restart becomes "repair 1"
+        # and the guard can loop forever instead of stopping at maxRepairs.
+        path = lib.optionals (cfg.guard.toolPath == [ ]) [ pkgs.pipewire pkgs.jq pkgs.gawk pkgs.systemd ];
 
         serviceConfig = {
           Type = "oneshot";

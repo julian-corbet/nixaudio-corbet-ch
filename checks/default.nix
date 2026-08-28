@@ -118,6 +118,19 @@ in
     && builtins.elem pkgs.wireplumber path
   );
 
+  # The guard's repair budget is a safety boundary, not optional tooling. Its state-window filter
+  # calls awk; omitting gawk from NixOS's exclusive service PATH used to truncate the attempts file
+  # on every run and turn a bounded three-restart repair into an unbounded WirePlumber restart loop.
+  guard-tooling = check "guard-tooling" (
+    let
+      path = nixos.config.systemd.user.services.nixaudio-alsa-guard.path;
+    in
+    builtins.elem pkgs.pipewire path
+    && builtins.elem pkgs.jq path
+    && builtins.elem pkgs.gawk path
+    && builtins.elem pkgs.systemd path
+  );
+
   pipewire-boundary = check "pipewire-boundary" (
     nixos.config.services.pipewire.jack.enable
     && !(nixos.config.services.pipewire ? extraConfig)
