@@ -19,7 +19,7 @@ use std::{
     io::{BufRead, BufReader},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -214,6 +214,29 @@ impl World {
     pub fn restart(&mut self) {
         self.stop_daemon();
         self.start_daemon(true);
+    }
+
+    /// Remove the private session bus and wait for the daemon to notice. A production user
+    /// service is restarted by systemd; the harness observes the process boundary directly so a
+    /// daemon that keeps serving audio but has silently lost its API cannot pass.
+    pub fn disconnect_bus_and_wait_for_daemon(&mut self) -> ExitStatus {
+        let _ = self.bus.kill();
+        let _ = self.bus.wait();
+
+        let deadline = Instant::now() + PATIENCE;
+        let daemon = self.daemon.as_mut().expect("a running daemon");
+        loop {
+            match daemon.try_wait().expect("poll nixaudiod after bus loss") {
+                Some(status) => return status,
+                None if Instant::now() >= deadline => {
+                    panic!(
+                        "nixaudiod stayed alive after its session bus disappeared\ndaemon stderr: {}",
+                        std::fs::read_to_string(&self.stderr_path).unwrap_or_default(),
+                    )
+                }
+                None => sleep(Duration::from_millis(20)),
+            }
+        }
     }
 
     fn stop_daemon(&mut self) {

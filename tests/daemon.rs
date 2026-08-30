@@ -47,6 +47,26 @@ fn the_daemon_answers_inspect_with_the_declared_device_name() {
     assert_eq!(streams[0]["title"], "A useful tab");
 }
 
+/// The D-Bus name is the daemon's public control plane, not an optional frontend. If the broker
+/// drops the connection, staying alive leaves audio workers running behind an API that no longer
+/// exists. Exiting non-zero lets the declared Restart=always policy reconnect cleanly.
+#[test]
+fn the_daemon_exits_when_its_session_bus_disappears() {
+    let mut world = World::local(one_sink_and_firefox("A useful tab"));
+    world.inspect();
+
+    let status = world.disconnect_bus_and_wait_for_daemon();
+
+    assert!(!status.success(), "bus loss must be a service failure");
+    assert!(
+        world
+            .daemon_stderr()
+            .contains("session D-Bus connection closed"),
+        "the failure names the lost service boundary: {}",
+        world.daemon_stderr(),
+    );
+}
+
 /// Sending audio where it is needed, and remembering that you did. One link per channel, matched
 /// by channel rather than by position, persisted across a restart of the daemon itself.
 #[test]

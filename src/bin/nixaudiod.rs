@@ -482,7 +482,19 @@ async fn main() -> Result<()> {
         });
     }
 
-    while events_rx.recv().await.is_some() {
+    loop {
+        // Owning the well-known D-Bus name is part of this process's service contract. zbus keeps
+        // a disconnected Connection value alive, so without watching the socket the audio/fabric
+        // workers continue indefinitely while every client sees ServiceUnknown. Exit instead;
+        // both NixOS and Home Manager declare Restart=always and will build a fresh connection.
+        let event = tokio::select! {
+            _ = connection.closed() => anyhow::bail!("session D-Bus connection closed"),
+            event = events_rx.recv() => event,
+        };
+        if event.is_none() {
+            break;
+        }
+
         sleep(Duration::from_millis(120)).await;
         while events_rx.try_recv().is_ok() {}
         let worker = controller.clone();
