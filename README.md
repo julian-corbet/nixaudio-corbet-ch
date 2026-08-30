@@ -99,8 +99,8 @@ nixaudioctl mute stream:123 on
 | Output | Use |
 |---|---|
 | `nixosModules.nixaudio` | complete NixOS plane |
-| `systemManagerModules.nixaudio` | Arch/CachyOS host facts and `/etc` configuration |
-| `homeManagerModules.nixaudio` | Arch/CachyOS user daemon and tray |
+| `systemManagerModules.nixaudio` | system-manager host facts and `/etc` mechanism |
+| `homeManagerModules.nixaudio` | Home Manager user daemon and tray mechanism |
 | `packages.<system>.nixaudio` | Rust daemon, CLI and tray |
 | `packages.<system>.jacktrip` | pinned upstream JackTrip 3.0.0 |
 
@@ -128,21 +128,24 @@ PAIR: both ends declare the same number, and each host gives every peer a distin
 what allows one independently supervised JackTrip process per peer. `transport.period`,
 `bitResolution`, `queue` and `redundancy` may be set host-wide and overridden per peer.
 
-An Arch host composes the system-manager and Home Manager planes. The system plane writes
-`/etc/nixaudio/config.json`; Home Manager points its user service at it:
+A foreign-system host composes the system-manager and Home Manager planes with its host hub's
+platform backend. The system plane writes `/etc/nixaudio/config.json`; Home Manager points its
+user service at it:
 
 ```nix
 nixaudio.daemon.externalConfigPath = "/etc/nixaudio/config.json";
 ```
 
-Every plane runs JackTrip under nixpkgs' own `pw-jack`, including on a foreign distribution. The
-shim exists only to redirect a `libjack.so.0` lookup, so it has to match the binary it redirects:
-this JackTrip is Nix-built and its RUNPATH names Nix's libjack2. A distribution that installs
-PipeWire's libjack into `/usr/lib` as the system-wide replacement for jack2 ships a `pw-jack` with
-its `LD_LIBRARY_PATH` line commented out — correct for its own binaries, a no-op for ours. This is
-not a second sound server: `pw-jack` ships no daemon, and libjack speaks the PipeWire protocol to
-whichever PipeWire already holds the session socket — the distribution's. JackTrip itself remains an
-upstream source build pinned by hash; it is not vendored or forked.
+NixAudio publishes the semantic backend contract as read-only `nixaudio.want`; it contains no
+package names or binary paths. Its NixOS backend resolves the contract through nixpkgs and NixOS
+options. A foreign host hub resolves the same roles into its own packages and command paths without
+becoming a NixAudio flake dependency.
+
+The JackTrip transport needs one special projection: it runs under nixpkgs' own `pw-jack` because
+the shim has to be ABI-matched to the Nix-built binary it redirects. This is not a second sound
+server: `pw-jack` ships no daemon, and libjack speaks the PipeWire protocol to whichever PipeWire
+already holds the session socket. The active platform backend owns that command, alongside the
+package decision that makes it correct.
 
 ## Security boundary
 

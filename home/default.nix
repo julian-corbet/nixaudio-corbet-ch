@@ -1,11 +1,11 @@
-# home-manager plane — the Arch/CachyOS hosts.
+# home-manager plane.
 #
 # WHY THIS EXISTS SEPARATELY FROM THE SYSTEM PLANES
 #
 # On a foreign-system host the audio graph is a USER-session concern: PipeWire runs as the logged-in
-# user, its config lives under ~/.config, and nixaudiod is a `systemd --user` unit. The host's package
-# reconciler is pacman/AUR convergence only — it has no file-placement or user-unit primitive — so it
-# cannot put any of this in place. home-manager is the mechanism that can.
+# user, its config lives under ~/.config, and nixaudiod is a `systemd --user` unit. Home Manager is
+# the mechanism that can place those files and units. The host hub's backend supplies platform
+# package resolution and paths in the same evaluation.
 #
 # Keeping this plane explicit prevents the daemon and its PipeWire drop-ins from becoming unmanaged
 # per-user files that drift away from the host-level declaration.
@@ -42,6 +42,7 @@ in
     ../modules/catalogue.nix
     ../modules/daemon.nix
     ../modules/guard.nix
+    ../modules/backend.nix
   ];
 
   options.nixaudio.daemon.externalConfigPath = lib.mkOption {
@@ -63,18 +64,6 @@ in
     # this host has to say so -- once, in a file both trees import. ../modules/dropins.nix has the
     # failure that follows from both writing.
     { nixaudio.dropIns = lib.mkDefault "user"; }
-
-    # nixpkgs' pw-jack, not the distro's, even here. JackTrip is the Nix-built binary and its
-    # RUNPATH names Nix's real libjack2, so the shim has to be ABI-matched to it or the redirect
-    # does nothing and JackTrip goes looking for a JACK server. Arch's own pw-jack cannot do it at
-    # all -- its LD_LIBRARY_PATH line is commented out, because Arch installs PipeWire's libjack
-    # into /usr/lib as the system-wide one. ../system-manager/default.nix carries the full reasoning.
-    (lib.mkIf cfg.fabric.enable {
-      nixaudio.fabric.transport.command = [
-        "${pkgs.pipewire.jack}/bin/pw-jack"
-        "${cfg.fabric.transport.package}/bin/jacktrip"
-      ];
-    })
 
     # ── The guard, and why it lives HERE on a non-NixOS host ─────────────────────────────────
     # It is a `systemd --user` unit, and this is the only plane on such a host with a real one.
@@ -110,9 +99,8 @@ in
           SuccessExitStatus = "SIGTERM";
         }
         // lib.optionalAttrs (cfg.guard.toolPath != [ ]) {
-          # On a distro host the running PipeWire is the DISTRO's, so the client this script calls
-          # must be too -- see nixaudio.guard.toolPath. This is the same anti-shadowing rule
-          # ../lib/packages.nix applies to the daemons.
+          # The platform backend supplies the clients matching the running PipeWire through
+          # nixaudio.guard.toolPath.
           Environment = [ "PATH=${lib.concatStringsSep ":" cfg.guard.toolPath}" ];
         };
 
@@ -160,7 +148,10 @@ in
           };
 
           Service = {
-            Environment = [ "NIXAUDIO_CONFIG=${daemonConfigPath}" "PATH=/usr/bin" ];
+            Environment =
+              [ "NIXAUDIO_CONFIG=${daemonConfigPath}" ]
+              ++ lib.optional (cfg.daemon.toolPath != [ ])
+                "PATH=${lib.concatStringsSep ":" cfg.daemon.toolPath}";
             ExecStart = "${cfg.daemon.package}/bin/nixaudiod";
             Restart = "always";
             RestartSec = 5;

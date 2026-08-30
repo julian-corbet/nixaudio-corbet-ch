@@ -1,4 +1,4 @@
-# The portable core: the device-naming layer, the fabric policy and the backend selection. All
+# The portable core: the device-naming layer, the fabric policy and the backend requirements. All
 # three are pure functions of declared data, so they are identical on NixOS and on a system-manager
 # host — only the projection onto the running system differs, and that lives in the per-plane files
 # (./nixos.nix, ./backend-nixos.nix, ../system-manager/default.nix).

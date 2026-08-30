@@ -47,6 +47,19 @@ in
         example = "alice";
         description = "NixOS user whose session PipeWire graph the nixaudio user services own.";
       };
+      toolPath = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          Complete command search path supplied by the active deployment backend. Empty means the
+          plane's native service PATH.
+
+          The daemon invokes PipeWire and session-policy clients by bare name because they must
+          match the graph that is actually running. A foreign-system backend therefore supplies
+          the distro's command directories; the NixOS projection supplies its matching packages
+          through the service's native `path` option.
+        '';
+      };
       settings = lib.mkOption {
         type = lib.types.attrsOf lib.types.unspecified;
         readOnly = true;

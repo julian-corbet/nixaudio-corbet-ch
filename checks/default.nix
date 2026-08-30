@@ -1,6 +1,7 @@
 { pkgs, nixpkgs, nixaudioModule, archModule }:
 let
   lib = nixpkgs.lib;
+  nixosRoles = import ../lib/nixos-roles.nix { inherit lib pkgs; };
 
   nixusbStub = { lib, ... }: {
     options.nixusb.devices = lib.mkOption {
@@ -69,6 +70,14 @@ let
     modules = [
       archModule
       commonStub
+      # A foreign-system backend owns this projection. Keep the fixture semantic to NixAudio: the
+      # nixarch repository tests the real package/path resolution without becoming a flake input.
+      ({ config, ... }: {
+        nixaudio.fabric.transport.command = [
+          "${pkgs.pipewire.jack}/bin/pw-jack"
+          "${config.nixaudio.fabric.transport.package}/bin/jacktrip"
+        ];
+      })
       {
         nixaudio.rt = {
           enable = true;
@@ -93,7 +102,19 @@ let
   };
   evalHome = extra: lib.evalModules {
     specialArgs = { inherit pkgs; };
-    modules = [ ../home/default.nix homeStub circle ] ++ extra;
+    modules = [
+      ../home/default.nix
+      homeStub
+      circle
+      ({ config, ... }: {
+        nixaudio.fabric.transport.command = [
+          "${pkgs.pipewire.jack}/bin/pw-jack"
+          "${config.nixaudio.fabric.transport.package}/bin/jacktrip"
+        ];
+        nixaudio.daemon.toolPath = [ "/platform/bin" ];
+        nixaudio.guard.toolPath = [ "/platform/bin" ];
+      })
+    ] ++ extra;
   };
 
   nixos = evalNixos [
@@ -108,6 +129,22 @@ let
       };
     }
   ];
+  # Real NixOS option types, not commonStub's intentionally opaque attrsets. This catches a
+  # misspelled or removed `services.pipewire.*` projection instead of accepting any shape.
+  realNixosBackend = lib.nixosSystem {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      nixaudioModule
+      {
+        system.stateVersion = "26.11";
+        nixaudio.backend = {
+          enable = true;
+          sofFirmware.enable = true;
+        };
+        nixaudio.guard.enable = false;
+      }
+    ];
+  };
   arch = evalArch [ ];
   home = evalHome [ ];
   failed = value: builtins.filter (assertion: !assertion.assertion) value.config.assertions;
@@ -163,8 +200,24 @@ in
   pipewire-boundary = check "pipewire-boundary" (
     nixos.config.services.pipewire.jack.enable
     && !(nixos.config.services.pipewire ? extraConfig)
-    && builtins.elem "pipewire-jack" arch.config.nixaudio.backend.archPackages
-    && !(builtins.elem "pipewire-zeroconf" arch.config.nixaudio.backend.archPackages)
+    && nixos.config.nixaudio.want == {
+      graph = "pipewire";
+      sessionPolicy = "wireplumber";
+      clientProtocols = [ "alsa" "jack" "pulse" ];
+      diagnostics = [ "alsa" ];
+      firmware = [ ];
+    }
+    && builtins.elem pkgs.alsa-utils nixos.config.environment.systemPackages
+    && !(builtins.elem pkgs.sof-firmware nixos.config.hardware.firmware)
+    && realNixosBackend.config.services.pipewire.enable
+    && realNixosBackend.config.services.pipewire.wireplumber.enable
+    && realNixosBackend.config.services.pipewire.alsa.enable
+    && realNixosBackend.config.services.pipewire.jack.enable
+    && realNixosBackend.config.services.pipewire.pulse.enable
+    && builtins.elem pkgs.alsa-utils realNixosBackend.config.environment.systemPackages
+    && realNixosBackend.config.nixaudio.want.firmware == [ "intel-sof" ]
+    && !(nixosRoles.supports (nixos.config.nixaudio.want // { graph = "unsupported"; }))
+    && !(nixosRoles.supports (nixos.config.nixaudio.want // { clientProtocols = [ "unknown" ]; }))
   );
 
   live-discovery = check "live-discovery" (
@@ -210,6 +263,10 @@ in
       "${home.config.nixaudio.fabric.transport.package}/bin/jacktrip"
     ]
     && home.config.xdg.configFile ? "wireplumber/wireplumber.conf.d/51-nixaudio-names.conf"
+    && home.config.nixaudio.daemon.toolPath == [ "/platform/bin" ]
+    && home.config.nixaudio.guard.toolPath == [ "/platform/bin" ]
+    && builtins.elem "PATH=/platform/bin"
+      home.config.systemd.user.services.nixaudiod.Service.Environment
     && !(home.config.xdg.configFile ? "pipewire/pipewire.conf.d/50-nixaudio-fabric-loops.conf")
     && !(home.config.xdg.configFile ? "pipewire/pipewire-pulse.conf.d/50-nixaudio-fabric-listener.conf")
   );

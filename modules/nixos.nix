@@ -169,7 +169,7 @@ in
         wants = [ "pipewire.service" "wireplumber.service" ];
         wantedBy = [ "default.target" ];
         # wpctl lives in wireplumber, not pipewire. Without it every default/volume/mute method
-        # fails on NixOS while the Arch plane, which resolves through /usr/bin, appears fine.
+        # fails on NixOS while a foreign-system plane with its own backend still appears fine.
         path = [ pkgs.coreutils pkgs.pipewire pkgs.wireplumber ];
         environment.NIXAUDIO_CONFIG = "/etc/nixaudio/config.json";
         unitConfig = lib.optionalAttrs (cfg.daemon.user != null) { ConditionUser = cfg.daemon.user; };

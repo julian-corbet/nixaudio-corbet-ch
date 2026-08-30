@@ -102,13 +102,11 @@
 let
   cfg = config.nixaudio.guard;
 
-  # No `runtimeInputs`, ON PURPOSE, and this is the anti-shadowing rule from ../lib/packages.nix
-  # applied to a script instead of a package. `pw-dump` is a PipeWire client speaking the native
-  # protocol to a specific running daemon; on an Arch host that daemon is pacman's, first on PATH
-  # and the only one there is. Baking a nixpkgs PipeWire into this script would point the probe at
-  # a different build of the client than the server it is interrogating, for no benefit. So the
-  # script names its tools bare and each plane supplies the PATH that is right for it — nixpkgs
-  # closures on NixOS, the distro's own `/usr/bin` on Arch (see `toolPath`).
+  # No `runtimeInputs`, ON PURPOSE: `pw-dump` is a PipeWire client speaking the native protocol to
+  # a specific running daemon. Baking a second platform's PipeWire into this script could point the
+  # probe at a different build from the server it interrogates. The script therefore names tools
+  # bare and each platform backend supplies the matching PATH — nixpkgs closures on NixOS, the
+  # running platform's own clients on a foreign system (see `toolPath`).
   #
   # writeShellApplication (not writeShellScript) because it runs shellcheck at build time and sets
   # `set -euo pipefail`: this script's whole job is to be right about a subtle condition on three
@@ -239,9 +237,8 @@ in
         enumeration exactly the same way. Turning it off is supported and means only that this host
         prefers to notice by ear.
 
-        Read defensively, the same way this repo reads `nixusb`: the home-manager plane
-        does not import ./backend.nix (package selection is a system concern, and on a distro host
-        the packages are pacman's), so there the fabric is what there is to follow.
+        The same default is used by every plane because `backend.nix` publishes only semantic
+        requirements; package selection remains the active platform backend's concern.
       '';
     };
 
@@ -396,17 +393,14 @@ in
     toolPath = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      example = [ "/usr/bin" ];
       description = ''
-        Directories prepended to the guard unit's `PATH`. Empty means the plane's own default.
+        Complete command search path supplied by the active deployment backend. Empty means the
+        plane's native service PATH.
 
         This exists because `pw-dump` must be the CLIENT MATCHING THE RUNNING SERVER, which is the
-        same anti-shadowing rule ../lib/packages.nix applies to the daemons themselves. On NixOS the
-        server is nixpkgs' and the NixOS plane wires the nixpkgs closure automatically, so this stays
-        empty. On an Arch host the server is pacman's, and the home-manager plane has no system PATH
-        of its own to inherit — a unit there gets the user manager's environment, which on a
-        graphical session includes `/usr/bin` but on a lingering headless one may not. Setting
-        `[ "/usr/bin" ]` there states the requirement instead of relying on it.
+        same anti-shadowing rule as the backend itself. On NixOS the server is nixpkgs' and the
+        NixOS plane wires the nixpkgs closure automatically, so this stays empty. A foreign-system
+        backend supplies directories containing clients from the same platform as the server.
       '';
     };
   };

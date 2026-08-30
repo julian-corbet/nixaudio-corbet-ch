@@ -24,18 +24,15 @@
       systemManagerModules.nixaudio = import ./system-manager/default.nix;
       systemManagerModules.default = self.systemManagerModules.nixaudio;
 
-      # The Arch/CachyOS hosts need the USER-session half: PipeWire runs as the logged-in user, its
-      # config lives under ~/.config, and the daemon is a `systemd --user` unit. nixarch's package
-      # reconciler is pacman convergence only and cannot place files or user units, so this is the
-      # mechanism that reaches those two nodes.
+      # The Home Manager plane owns user-session config and units. A foreign host hub supplies its
+      # package and command-path backend in the same evaluation.
       homeManagerModules.nixaudio = import ./home/default.nix;
       homeManagerModules.default = self.homeManagerModules.nixaudio;
 
-      # The backend table and its resolution, exposed so a consumer can inspect or validate them
-      # without re-reading the files -- e.g. to see which packages a host will be told to install
-      # before wiring anything.
-      lib.packages = import ./lib/packages.nix { };
-      lib.resolve = import ./lib/resolve.nix { inherit lib; };
+      # NixOS resolution is exposed as a pure helper over the package set this flake already owns.
+      # There is deliberately no Arch package table here: nixarch resolves the same `nixaudio.want`
+      # contract without becoming an input of this flake (the family contract's R4 boundary).
+      lib.nixosRoles = pkgs: import ./lib/nixos-roles.nix { inherit lib pkgs; };
 
       # The two diagnostics, runnable without composing anything. Both are ordinarily wired into a
       # unit or a scheduler by a plane, but the whole point of a health probe is that a human can
