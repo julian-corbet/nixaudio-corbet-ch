@@ -40,6 +40,7 @@ in
     ../modules/catalogue.nix
     ../modules/daemon.nix
     ../modules/guard.nix
+    ../modules/rt.nix
     ../modules/backend.nix
   ];
 
@@ -58,6 +59,12 @@ in
     (lib.mkIf (cfg.dropIns == "system" && cfg.guard.wireplumberConfig != "") {
       environment.etc."wireplumber/wireplumber.conf.d/50-nixaudio-reservation.conf".text =
         cfg.guard.wireplumberConfig;
+    })
+
+    # PAM is a host concern on a foreign-system plane. Project the same pure limits data the NixOS
+    # plane consumes into limits.d; Home Manager cannot grant process limits after login.
+    (lib.mkIf cfg.rt.enable {
+      environment.etc."security/limits.d/50-nixaudio.conf".text = cfg.rt.limitsConfig;
     })
 
     # ── THE JACK SHIM IS NIX'S, EVEN THOUGH THE SOUND SERVER IS THE DISTRO'S ────────────────────
@@ -85,7 +92,7 @@ in
     # So the shim comes from nixpkgs, matched to the binary it redirects. This is NOT a second sound
     # server: `pw-jack` ships no daemon, and libjack speaks the PipeWire protocol to whichever
     # PipeWire is already listening on the session socket -- the distro's. That boundary is a
-    # protocol, not an ABI, and both ends are PipeWire 1.6.x. Proven live on corbet-archlxc: a Nix
+    # protocol, not an ABI, and both ends use compatible PipeWire protocol versions. Proven live: a Nix
     # JackTrip under this shim reaches Arch's running PipeWire and reports "Setting JACK Process
     # Callback... SUCCESS" at 48000/128.
     #

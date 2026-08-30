@@ -11,7 +11,7 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 2
 fi
 
-audio_user=${NIXAUDIO_TEST_USER:-richc}
+audio_user=${NIXAUDIO_TEST_USER:-nixaudio-test}
 audio_uid=$(id -u "$audio_user")
 runtime_dir=${NIXAUDIO_TEST_RUNTIME_DIR:-/run/user/$audio_uid}
 test_tag=$$
@@ -107,15 +107,14 @@ ip -n "$namespace_a" link set "$veth_a" up
 ip -n "$namespace_b" link set "$veth_b" up
 
 common_args=(
-  --bindport 46321
-  --peerport 46321
+  --bindport 26421
+  --peerport 26421
   --nojackportsconnect
   --srate 48000
   --bufsize 128
   --bitres 16
-  --queue 4
+  --queue auto
   --redundancy 1
-  --zerounderrun
   --bufstrategy 3
   --timeout
 )

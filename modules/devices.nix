@@ -1,10 +1,10 @@
-# nixaudio.devices — give every audio device a stable name the whole fleet agrees on.
+# nixaudio.devices — give every audio device a stable name every participating host agrees on.
 #
 # WHY THIS IS NOT JUST COSMETIC
 #
 # PipeWire's own node names embed the machine's USB topology:
 #
-#   alsa_card.usb-HP__Inc_HyperX_Cloud_III_S_Wireless_C1V51706C2-00.2
+#   alsa_card.usb-Example_Corp_Audio_Device_TEST0001-00.2
 #   api.alsa.path = hw:1
 #   device.bus-path = pci-0000:00:14.0-usb-0:1.2.4:1.0
 #
@@ -20,10 +20,10 @@
 #
 # Verified live against `pw-dump` on a real device rather than assumed:
 #
-#   device.vendor.id   = 0x03f0     <- stable, note the 0x prefix and lowercase hex
-#   device.product.id  = 0x06be     <- stable
-#   device.bus-id      = usb-HP__Inc_HyperX_Cloud_III_S_Wireless_C1V51706C2-00   <- stable, carries serial
-#   device.serial      = HP__Inc_HyperX_Cloud_III_S_Wireless_C1V51706C2          <- mangled, NOT the raw serial
+#   device.vendor.id   = 0x1234     <- stable, note the 0x prefix and lowercase hex
+#   device.product.id  = 0xabcd     <- stable
+#   device.bus-id      = usb-Example_Corp_Audio_Device_TEST0001-00   <- stable, carries serial
+#   device.serial      = Example_Corp_Audio_Device_TEST0001          <- mangled, NOT the raw serial
 #   api.alsa.path      = hw:1       <- UNSTABLE, enumeration order
 #   device.bus-path    = pci-...    <- UNSTABLE, physical port
 #
@@ -34,7 +34,7 @@
 #
 # ── WHERE THE DEVICE LIST COMES FROM ────────────────────────────────────────────────────────────
 #
-# USB devices are not re-declared here. They come from `nixusb.devices` — the fleet's single USB
+# USB devices are not re-declared here. They come from `nixusb.devices` — the shared USB
 # inventory — filtered to those carrying the `audio` tag. Read defensively so nixusb stays an
 # optional input: a host that has not adopted nixusb simply contributes nothing, and can still
 # declare non-USB devices (an internal PCI codec, a virtual sink) through `nixaudio.devices` directly.
@@ -84,7 +84,7 @@
 #   - Zero and below are refused by the option's own type: a usable local endpoint needs a positive
 #     WirePlumber session priority.
 #   - No ceiling is declared because PipeWire's own ALSA-monitor-assigned `priority.session` for real
-#     hardware is not a fixed, documented range: verified live across this fleet's own devices it
+#     hardware is not a fixed, documented range: verified live across representative devices it
 #     spans at least 664 (an HDMI output nobody wants first) to 2100 (a muted fallback microphone),
 #     profile- and port-dependent, with nothing upstream promising that ceiling won't move the next
 #     time a device or profile is added. `priority` only ever has to outrank whatever number the
@@ -112,8 +112,8 @@ let
   #
   # `source` is not cosmetic: it is what modules/catalogue.nix uses to decide which of THIS host's
   # devices it may assume also exist, by the same name, on a PEER host it has never evaluated.
-  # nixusb.devices is the fleet's single inventory (one declaration, composed unchanged wherever
-  # nixusb is imported -- see the README), so a "usb" entry is fleet-shared vocabulary; an
+  # nixusb.devices is the shared inventory (one declaration, composed unchanged wherever nixusb is
+  # imported -- see the README), so a "usb" entry is shared vocabulary; an
   # "explicit" entry is this host's own hand-declared hardware (a PCI codec, a virtual sink) that no
   # other host's config has any way of knowing about. Conflating the two would let the catalogue
   # claim a peer has a device that is actually only wired into THIS box.
@@ -516,7 +516,7 @@ in
         module and health checks can reason about what this host is expected to publish without
         recomputing the projection.
 
-        Each entry carries `source`: `"usb"` for a device derived from `nixusb.devices` (the fleet's
+        Each entry carries `source`: `"usb"` for a device derived from `nixusb.devices` (the shared
         single inventory, so the same name is assumed to apply wherever nixusb is composed) or
         `"explicit"` for one declared directly in `nixaudio.devices` on this host only. See
         `nixaudio.fabric.catalogue`, the consumer this distinction exists for.

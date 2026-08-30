@@ -99,7 +99,7 @@ in
       default = null;
       description = ''
         Locked-memory limit in KB, or `"unlimited"`. Left unset by default: PipeWire does not
-        require raised memlock, and raising it fleet-wide for a limit nothing asks for is a change
+        require raised memlock, and raising it on every host for a limit nothing asks for is a change
         without a reason. Set it if you run JACK clients that genuinely need it.
       '';
     };
@@ -114,17 +114,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    security.pam.loginLimits = [
-      { domain = "@${cfg.group}"; type = "-"; item = "rtprio"; value = toString cfg.rtprio; }
-      { domain = "@${cfg.group}"; type = "-"; item = "nice"; value = toString cfg.nice; }
-    ]
-    ++ lib.optional (cfg.memlock != null) {
-      domain = "@${cfg.group}";
-      type = "-";
-      item = "memlock";
-      value = toString cfg.memlock;
-    };
-
     assertions = [
       {
         # Only checkable when nixiam is actually composed. Where it is not, the group is assumed to

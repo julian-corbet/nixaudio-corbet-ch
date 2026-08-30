@@ -42,10 +42,10 @@ in
         description = "Package providing nixaudiod, nixaudioctl and nixaudio-tray.";
       };
       user = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
+        type = lib.types.nullOr lib.types.nonEmptyStr;
         default = null;
         example = "alice";
-        description = "NixOS user whose session PipeWire graph nixaudiod owns.";
+        description = "NixOS user whose session PipeWire graph the nixaudio user services own.";
       };
       settings = lib.mkOption {
         type = lib.types.attrsOf lib.types.unspecified;
@@ -71,5 +71,14 @@ in
         description = "Package providing nixaudio-tray.";
       };
     };
+  };
+
+  config.assertions = lib.optional cfg.fabric.enable {
+    assertion = cfg.daemon.enable;
+    message = ''
+      nixaudio.fabric.enable requires nixaudio.daemon.enable. The daemon is the runtime owner of
+      peer discovery, JackTrip supervision and graph routing; a fabric without it renders static
+      configuration but never joins the declared peers.
+    '';
   };
 }

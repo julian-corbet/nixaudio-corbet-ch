@@ -46,11 +46,38 @@ let
 
   evalNixos = extra: lib.evalModules {
     specialArgs = { inherit pkgs; };
-    modules = [ nixaudioModule commonStub { nixaudio.daemon.user = "tester"; } circle ] ++ extra;
+    modules = [
+      nixaudioModule
+      commonStub
+      {
+        nixaudio.daemon.user = "audio-test";
+        nixaudio.rt = {
+          enable = true;
+          group = "studio-audio";
+          memlock = "unlimited";
+        };
+      }
+      circle
+    ] ++ extra;
+  };
+  evalNixosBare = extra: lib.evalModules {
+    specialArgs = { inherit pkgs; };
+    modules = [ nixaudioModule commonStub ] ++ extra;
   };
   evalArch = extra: lib.evalModules {
     specialArgs = { inherit pkgs; };
-    modules = [ archModule commonStub circle ] ++ extra;
+    modules = [
+      archModule
+      commonStub
+      {
+        nixaudio.rt = {
+          enable = true;
+          group = "studio-audio";
+          memlock = "unlimited";
+        };
+      }
+      circle
+    ] ++ extra;
   };
 
   homeStub = { lib, ... }: {
@@ -72,11 +99,11 @@ let
   nixos = evalNixos [
     nixusbStub
     {
-      nixusb.devices.hyperx = {
-        vendorId = "03f0";
-        productId = "06be";
-        serial = "C1V51706C2";
-        description = "HyperX";
+      nixusb.devices.headset = {
+        vendorId = "1234";
+        productId = "abcd";
+        serial = "TEST-SERIAL-0001";
+        description = "Test headset";
         tags = [ "audio" ];
       };
     }
@@ -95,8 +122,10 @@ in
   architecture = check "architecture" (
     nixos.config.nixaudio.daemon.settings.node == "alpha"
     && nixos.config.nixaudio.daemon.settings.control.listen == "192.0.2.1"
+    && nixos.config.nixaudio.daemon.settings.control.port == 26300
     && nixos.config.nixaudio.daemon.settings.peers.beta.addresses
     == [ "192.0.2.2" "beta.example.net" ]
+    && nixos.config.nixaudio.daemon.settings.peers.beta.controlPort == 26300
     && nixos.config.nixaudio.daemon.settings.peers.beta.audioPort == 26301
     && nixos.config.nixaudio.daemon.settings.transport.command
     == [
@@ -139,9 +168,27 @@ in
   );
 
   live-discovery = check "live-discovery" (
-    builtins.attrNames nixos.config.nixaudio.fabric.catalogue == [ "hyperx" ]
-    && nixos.config.nixaudio.fabric.catalogue.hyperx.origin == "local"
-    && !(nixos.config.nixaudio.fabric.catalogue ? "beta.hyperx")
+    builtins.attrNames nixos.config.nixaudio.fabric.catalogue == [ "headset" ]
+    && nixos.config.nixaudio.fabric.catalogue.headset.origin == "local"
+    && !(nixos.config.nixaudio.fabric.catalogue ? "beta.headset")
+  );
+
+  realtime-projection = check "realtime-projection" (
+    builtins.elem "audio" nixos.config.users.users.audio-test.extraGroups
+    && builtins.elem "studio-audio" nixos.config.users.users.audio-test.extraGroups
+    && nixos.config.security.pam.loginLimits == [
+      { domain = "@studio-audio"; type = "-"; item = "rtprio"; value = "95"; }
+      { domain = "@studio-audio"; type = "-"; item = "nice"; value = "-11"; }
+      { domain = "@studio-audio"; type = "-"; item = "memlock"; value = "unlimited"; }
+    ]
+    && arch.config.environment.etc."security/limits.d/50-nixaudio.conf".text
+    == arch.config.nixaudio.rt.limitsConfig
+  );
+
+  user-unit-safety = check "user-unit-safety" (
+    nixos.config.nixaudio.guard.user == "audio-test"
+    && nixos.config.systemd.user.services.nixaudiod.unitConfig.ConditionUser == "audio-test"
+    && nixos.config.systemd.user.services.nixaudio-alsa-guard.unitConfig.ConditionUser == "audio-test"
   );
 
   arch-plane = check "arch-plane" (
@@ -171,6 +218,12 @@ in
     failed nixos == [ ]
     && failed arch == [ ]
     && failed home == [ ]
+    && failed (evalNixos [{ nixaudio.fabric.transport.queue = "auto250"; }]) == [ ]
+    && failed (evalNixos [{ nixaudio.fabric.transport.queue = "auto251"; }]) != [ ]
+    && failed (evalNixos [{ nixaudio.fabric.transport.queue = "4"; }]) != [ ]
+    && failed (evalNixos [{ nixaudio.daemon.enable = false; }]) != [ ]
+    && failed (evalNixosBare [{ nixaudio.backend.enable = true; }]) != [ ]
+    && failed (evalNixosBare [{ nixaudio.tray.enable = true; }]) != [ ]
     && failed
       (evalNixos [{
         nixaudio.fabric.peers.alpha = {

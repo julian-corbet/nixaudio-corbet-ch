@@ -56,8 +56,8 @@
 # here, and would have this thing restarting wireplumber forever:
 #
 #   * A card with no PCM device at all is dropped by PipeWire's own ALSA plugin permanently
-#     (`card->ignored`), and one such card exists on two of the three hosts this was built against.
-#   * A card can be excluded ON PURPOSE. One host disables its GPU's HDMI audio function outright
+#     (`card->ignored`), and such cards exist on supported hosts.
+#   * A card can be excluded ON PURPOSE. A host may disable its GPU's HDMI audio function outright
 #     with a `device.disabled = true` rule, because a container on the same box holds the same
 #     kernel device. That is correct configuration, and an equality check would read it as damage.
 #   * A profile can legitimately be `off` — an unplugged HDMI output contributes no node and should
@@ -246,7 +246,7 @@ in
     };
 
     user = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
+      type = lib.types.nullOr lib.types.nonEmptyStr;
       default = null;
       example = "alice";
       description = ''

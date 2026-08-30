@@ -11,13 +11,22 @@ in
     { nixaudio.dropIns = lib.mkDefault "system"; }
 
     {
-      assertions = lib.optional cfg.daemon.enable {
-        assertion = cfg.daemon.user != null;
-        message = ''
-          nixaudio.daemon.user must name the NixOS user whose PipeWire graph nixaudiod
-          manages when the daemon is enabled.
-        '';
-      };
+      assertions =
+        lib.optional (cfg.daemon.enable || cfg.tray.enable) {
+          assertion = cfg.daemon.user != null;
+          message = ''
+            nixaudio.daemon.user must name the NixOS user whose PipeWire graph the enabled
+            nixaudio user services manage.
+          '';
+        }
+        ++ lib.optional cfg.guard.enable {
+          assertion = cfg.guard.user != null;
+          message = ''
+            nixaudio.guard.user must name the NixOS user whose PipeWire graph is guarded. NixOS
+            installs systemd user units for every user manager, so an unfenced guard can inspect an
+            unrelated empty session and restart that session's WirePlumber.
+          '';
+        };
     }
 
     # NixOS installs user units into every user's manager. State the intended owner once and use it
@@ -27,11 +36,29 @@ in
       (cfg.daemon.enable && cfg.daemon.user != null)
       {
         users.users.${cfg.daemon.user} = {
-          extraGroups = [ "audio" ];
+          extraGroups = lib.unique ([ "audio" ] ++ lib.optional cfg.rt.enable cfg.rt.group);
           linger = true;
         };
-        nixaudio.guard.user = lib.mkDefault cfg.daemon.user;
       })
+
+    # The guard may run for a local-only backend with no fabric daemon. Reuse the declared session
+    # owner whenever one exists, independently of whether nixaudiod itself is enabled.
+    (lib.mkIf (cfg.daemon.user != null) {
+      nixaudio.guard.user = lib.mkDefault cfg.daemon.user;
+    })
+
+    (lib.mkIf cfg.rt.enable {
+      security.pam.loginLimits = [
+        { domain = "@${cfg.rt.group}"; type = "-"; item = "rtprio"; value = toString cfg.rt.rtprio; }
+        { domain = "@${cfg.rt.group}"; type = "-"; item = "nice"; value = toString cfg.rt.nice; }
+      ]
+      ++ lib.optional (cfg.rt.memlock != null) {
+        domain = "@${cfg.rt.group}";
+        type = "-";
+        item = "memlock";
+        value = toString cfg.rt.memlock;
+      };
+    })
 
     # ── The guard is gated on ITSELF, not on the fabric ───────────────────────────────────────
     # A host can declare its audio backend without joining any device pool (that is exactly what
@@ -51,8 +78,8 @@ in
         partOf = [ "wireplumber.service" ];
         wantedBy = [ "wireplumber.service" ];
 
-        # ConditionUser, for the same reproduced incident this repo's consumers already patch
-        # nixaudiod for: systemd.user.services installs into EVERY user's manager, and a root
+        # ConditionUser prevents a reproduced cross-session failure: systemd.user.services
+        # installs into EVERY user's manager, and a root
         # login would otherwise run a guard against a session it cannot see, find no graph, and
         # start restarting another user's wireplumber.
         # optionalAttrs rather than mkIf: this is a plain attribute of a unit definition, not an

@@ -45,8 +45,7 @@ in
 
           Deliberately below the kernel's default ephemeral floor of 32768. A port inside that range
           is one the kernel may hand to any process that asks for "any port"; if it does so before
-          this daemon binds, the host silently drops out of its circle. The previous default, 45900,
-          sat inside it.
+          this daemon binds, the host silently drops out of its circle.
         '';
       };
     };
@@ -245,6 +244,9 @@ in
     # own headroom at a period. Checked per link, because `period` is now a per-link property.
     let
       fixedMs = queue: if builtins.match "[0-9]+" queue != null then lib.toInt queue else null;
+      autoHeadroomMs = queue:
+        let match = builtins.match "auto([0-9]+)" queue;
+        in if match == null then null else lib.toInt (builtins.head match);
       floorMs = period: (2000 * period + cfg.transport.sampleRate - 1) / cfg.transport.sampleRate;
       links = [{ name = "transport"; inherit (cfg.transport) queue period; }]
         ++ lib.mapAttrsToList
@@ -255,17 +257,28 @@ in
           })
           cfg.peers;
     in
-    map
-      (link: {
-        assertion = let ms = fixedMs link.queue; in ms == null || ms >= floorMs link.period;
-        message = ''
-          nixaudio.fabric.${link.name}.queue is ${link.queue} ms of FIXED jitter tolerance, below
-          the ${toString (floorMs link.period)} ms that two periods of ${toString link.period}
-          frames at ${toString cfg.transport.sampleRate} Hz occupy. Under bufstrategy 3 that number
-          is milliseconds, not packets, and adaptation is off. Use "auto" unless you have measured
-          this link.
-        '';
-      })
+    lib.concatMap
+      (link: [
+        {
+          assertion = let ms = fixedMs link.queue; in ms == null || ms >= floorMs link.period;
+          message = ''
+            nixaudio.fabric.${link.name}.queue is ${link.queue} ms of FIXED jitter tolerance, below
+            the ${toString (floorMs link.period)} ms that two periods of ${toString link.period}
+            frames at ${toString cfg.transport.sampleRate} Hz occupy. Under bufstrategy 3 that number
+            is milliseconds, not packets, and adaptation is off. Use "auto" unless you have measured
+            this link.
+          '';
+        }
+        {
+          assertion = let ms = autoHeadroomMs link.queue; in ms == null || ms <= 250;
+          message = ''
+            nixaudio.fabric.${link.name}.queue is "${link.queue}", which seeds
+            ${toString (autoHeadroomMs link.queue)} ms of adaptive headroom, past JackTrip's 250 ms
+            cap. Use "auto" to let the Regulator choose its own initial value, or choose an auto<N>
+            seed no greater than 250.
+          '';
+        }
+      ])
       links
   );
 }

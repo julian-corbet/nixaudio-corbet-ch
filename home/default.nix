@@ -2,16 +2,13 @@
 #
 # WHY THIS EXISTS SEPARATELY FROM THE SYSTEM PLANES
 #
-# Two of the three fleet nodes (a laptop and an Arch/CachyOS container, say) are not NixOS, and the
-# audio graph on them is a USER-session concern: PipeWire runs as the logged-in user, its config
-# lives under ~/.config, and nixaudiod is a `systemd --user` unit. nixarch's package
+# On a foreign-system host the audio graph is a USER-session concern: PipeWire runs as the logged-in
+# user, its config lives under ~/.config, and nixaudiod is a `systemd --user` unit. The host's package
 # reconciler is pacman/AUR convergence only — it has no file-placement or user-unit primitive — so it
 # cannot put any of this in place. home-manager is the mechanism that can.
 #
-# This is exactly the gap that produced the original problem: the daemon and its PipeWire drop-ins
-# were placed by hand on each Arch host, described by no configuration anywhere, and drifted. One
-# host's copy still carried a comment claiming a firewall protected it that had since been replaced
-# by a different mechanism entirely.
+# Keeping this plane explicit prevents the daemon and its PipeWire drop-ins from becoming unmanaged
+# per-user files that drift away from the host-level declaration.
 #
 # WHAT IS SHARED AND WHAT IS NOT
 #
