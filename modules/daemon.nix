@@ -1,9 +1,8 @@
 # nixaudiod is the single runtime owner of the live PipeWire graph. Nix owns its executable,
 # declared device/peer vocabulary and service lifecycle; remembered routes remain user state.
-{ lib, config, pkgs, ... }:
+{ lib, config, pkgs, nixaudioPackage, ... }:
 let
   cfg = config.nixaudio;
-  package = import ../package.nix { inherit pkgs; };
   daemonConfig = {
     node = cfg.fabric.node;
     control = cfg.fabric.control;
@@ -37,7 +36,7 @@ in
       };
       package = lib.mkOption {
         type = lib.types.package;
-        default = package;
+        default = nixaudioPackage;
         defaultText = lib.literalExpression "the nixaudio Rust package from this flake";
         description = "Package providing nixaudiod, nixaudioctl and nixaudio-tray.";
       };

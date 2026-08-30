@@ -1,7 +1,8 @@
-{ pkgs, nixpkgs, nixaudioModule, archModule }:
+{ pkgs, nixpkgs, nixaudioPackage, nixaudioModule, archModule, homeModule }:
 let
   lib = nixpkgs.lib;
   nixosRoles = import ../lib/nixos-roles.nix { inherit lib pkgs; };
+  cargoManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
 
   nixusbStub = { lib, ... }: {
     options.nixusb.devices = lib.mkOption {
@@ -103,7 +104,7 @@ let
   evalHome = extra: lib.evalModules {
     specialArgs = { inherit pkgs; };
     modules = [
-      ../home/default.nix
+      homeModule
       homeStub
       circle
       ({ config, ... }: {
@@ -153,7 +154,28 @@ let
     pkgs.runCommand "nixaudio-${name}" { } "touch $out";
 in
 {
-  rust = import ../package.nix { inherit pkgs; };
+  # Building this derivation compiles every binary and runs the crate's unit and private-D-Bus
+  # integration tests. Keep it as the primary Rust check: the package and the tested object must
+  # never drift into two independently configured Cargo builds.
+  rust = nixaudioPackage;
+
+  # Crane installs binaries from Cargo's JSON build log, not through buildRustPackage's install
+  # hook. Assert the public package surface explicitly so a packaging migration cannot stay green
+  # after silently dropping the daemon or tray while the library tests still pass.
+  rust-package-outputs =
+    assert nixaudioPackage.meta.mainProgram == "nixaudioctl";
+    assert nixaudioPackage.meta.license.spdxId == "MIT";
+    assert cargoManifest.profile.release.lto == "thin";
+    assert cargoManifest.profile.release.strip;
+    assert nixaudioPackage ? cargoArtifacts;
+    pkgs.runCommand "nixaudio-rust-package-outputs" { } ''
+      set -euo pipefail
+      for program in nixaudioctl nixaudiod nixaudio-tray; do
+        test -x "${nixaudioPackage}/bin/$program"
+      done
+      touch "$out"
+    '';
+
   jacktrip = import ../jacktrip-package.nix { inherit pkgs; };
 
   architecture = check "architecture" (
@@ -169,6 +191,17 @@ in
       "${pkgs.pipewire.jack}/bin/pw-jack"
       "${nixos.config.nixaudio.fabric.transport.package}/bin/jacktrip"
     ]
+  );
+
+  # These are the public module entry points an external consumer imports. None receives a package
+  # through specialArgs here; the flake export must capture the Crane-built default itself, exactly
+  # as the former direct package.nix import did for callers.
+  module-package-defaults = check "module-package-defaults" (
+    toString nixos.config.nixaudio.daemon.package == toString nixaudioPackage
+    && toString arch.config.nixaudio.daemon.package == toString nixaudioPackage
+    && toString home.config.nixaudio.daemon.package == toString nixaudioPackage
+    && toString nixos.config.nixaudio.tray.package == toString nixaudioPackage
+    && toString home.config.nixaudio.tray.package == toString nixaudioPackage
   );
 
   # NixOS renders `path` as an exclusive Environment=PATH, so anything the daemon shells out to and

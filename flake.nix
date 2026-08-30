@@ -2,6 +2,7 @@
   description = "Audio as one declared fleet-wide fact: stable device names from the shared USB inventory, and a many-to-many cross-host device pool addressed by name rather than by address.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.crane.url = "github:ipetkov/crane";
   inputs.system-manager.url = "github:numtide/system-manager";
   inputs.system-manager.inputs.nixpkgs.follows = "nixpkgs";
 
@@ -10,23 +11,32 @@
   # A host that composes nixusb gets stable USB identity from its shared inventory. Peer membership
   # is always explicit nixaudio data: an audio circle must not silently grow whenever a generic
   # network peer appears, and no overlay product is part of the transport contract.
-  outputs = { self, nixpkgs, system-manager }:
+  outputs = { self, nixpkgs, crane, system-manager }:
     let
       lib = nixpkgs.lib;
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = lib.genAttrs supportedSystems;
       pkgsFor = system: import nixpkgs { inherit system; };
+      nixaudioPackageFor = pkgs: import ./package.nix {
+        inherit pkgs;
+        craneLib = crane.mkLib pkgs;
+      };
+      withNixaudioPackage = module: { pkgs, ... }: {
+        imports = [ module ];
+        _module.args.nixaudioPackage = nixaudioPackageFor pkgs;
+      };
     in
     {
-      nixosModules.nixaudio = import ./modules/default.nix;
+      nixosModules.nixaudio = withNixaudioPackage ./modules/default.nix;
       nixosModules.default = self.nixosModules.nixaudio;
 
-      systemManagerModules.nixaudio = import ./system-manager/default.nix;
+      systemManagerModules.nixaudio = withNixaudioPackage ./system-manager/default.nix;
       systemManagerModules.default = self.systemManagerModules.nixaudio;
 
       # The Home Manager plane owns user-session config and units. A foreign host hub supplies its
-      # package and command-path backend in the same evaluation.
-      homeManagerModules.nixaudio = import ./home/default.nix;
+      # command-path backend in the same evaluation. The wrapper supplies the cached Rust package
+      # while preserving that platform-owned projection boundary.
+      homeManagerModules.nixaudio = withNixaudioPackage ./home/default.nix;
       homeManagerModules.default = self.homeManagerModules.nixaudio;
 
       # NixOS resolution is exposed as a pure helper over the package set this flake already owns.
@@ -42,7 +52,10 @@
         let
           pkgs = pkgsFor system;
           moduleEval = lib.evalModules {
-            specialArgs = { inherit pkgs; };
+            specialArgs = {
+              inherit pkgs;
+              nixaudioPackage = nixaudioPackageFor pkgs;
+            };
             modules = [
               ./modules/guard.nix
               ./modules/monitor.nix
@@ -58,7 +71,7 @@
           };
         in
         {
-          nixaudio = import ./package.nix { inherit pkgs; };
+          nixaudio = nixaudioPackageFor pkgs;
           jacktrip = import ./jacktrip-package.nix { inherit pkgs; };
           alsa-guard = moduleEval.config.nixaudio.guard.package;
           fabric-health = moduleEval.config.nixaudio.fabric.healthCheck;
@@ -66,11 +79,16 @@
         });
 
       checks = forAllSystems (system:
-        import ./checks {
+        let
           pkgs = pkgsFor system;
+        in
+        import ./checks {
+          inherit pkgs;
           inherit nixpkgs;
+          nixaudioPackage = nixaudioPackageFor pkgs;
           nixaudioModule = self.nixosModules.nixaudio;
           archModule = self.systemManagerModules.nixaudio;
+          homeModule = self.homeManagerModules.nixaudio;
         }
       );
 
